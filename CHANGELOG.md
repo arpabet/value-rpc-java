@@ -7,7 +7,64 @@ in one version.
 
 ## Unreleased
 
-Nothing yet.
+The server, ahead of its place in the plan, and a WebSocket listener for it,
+so that a browser reaches a Java server: the client there is `@arpabet/vrpc`
+(value-rpc-js). The version between releases is 0.2.0-SNAPSHOT.
+
+### Added
+
+- **The server**, `com.arpabet.valuerpc.server.VrpcServer`, in the core: it
+  depends on nothing new and passes the check of Android 8.0.
+  - The four patterns, served: `addFunction`, `addOutgoingStream`,
+    `addIncomingStream` and `addChat` (`Registrar`), with handlers that stay
+    for as long as their request lasts (`UnaryHandler`,
+    `OutgoingStreamHandler`, `IncomingStreamHandler`, `ChatHandler`), the
+    credit-based flow control of the protocol in both directions, and the
+    arguments and results checked against a `TypeDef`.
+  - `RequestContext`: the principal, the metadata, the time the caller still
+    waits, and whether it still waits. A request that the client cancels,
+    whose time has passed, or whose connection is lost has its handler
+    interrupted.
+  - The handshake as the Go server answers it: silence for what is not one,
+    a coded refusal for what is; an `Authenticator` for the credential and a
+    `ConnectAuthorizer` for the connection.
+  - Sessions: a client that reconnects is the same session when it is the
+    same principal and shows the next link of its hash chain; the session of
+    one that does not come back is dropped after two minutes.
+  - Limits: connections, requests of a client at once (one too many is
+    refused, not queued), streams of a client at once.
+  - Closing writes the messages that are queued, the answers of finished
+    calls above all, before it closes the connections.
+  - `ServerListener` for what happens to the connections; `Metrics` as for a
+    client.
+- **A WebSocket listener**, in the core, on plain sockets:
+  `ws://host:port/path` as the address of a server, or
+  `Transports.webSocketListener` with `WebSocketOptions`. MessagePack in
+  binary frames and JSON in text frames, agreed on by subprotocol as the Go
+  listener agrees on them; the origins a browser may connect from; a ping for
+  a silent connection; the closing handshake. No TLS and no compression.
+- `conformance/client`, the Go client as a program, also over TCP with every
+  scenario and over WebSocket (`-ws`, `-codec`), with scenarios for streams,
+  metadata, the credential, deadlines, cancellation and resumption.
+- `ConformanceServer`, the Java twin of the Go conformance server, as a test
+  fixture and as a program: `./gradlew :value-rpc:conformanceServer`.
+
+### Not yet
+
+- A server that calls its clients, and a client that serves such calls.
+- A WebSocket client; `wss://`; a WebSocket listener on Netty.
+
+### Compatibility
+
+- Checked at every build, where there is a Go toolchain: the Go client
+  against this server over TCP and over WebSocket in both codecs, with calls,
+  the three kinds of stream, deadlines, cancellation, the credential, and a
+  dropped connection that is resumed.
+- Checked by hand against the conformance suite of value-rpc-js 0.4.0: 15 of
+  its 19 scenarios pass in each codec, and the 4 that do not are the ones in
+  which the server calls its client.
+- Where the server differs from the Go one, a client does not have to know:
+  [MIGRATION_PLAN.md](MIGRATION_PLAN.md) lists it under Progress.
 
 ## v0.1.0 — 2026-11-25
 

@@ -14,7 +14,7 @@ allprojects {
     // Between releases, the next version with -SNAPSHOT. A release takes the
     // suffix off and is tagged `v` + the version (.github/workflows/release.yaml).
     // The modules are released together, in one version.
-    version = "0.1.0"
+    version = "0.2.0-SNAPSHOT"
 
     repositories {
         mavenCentral()

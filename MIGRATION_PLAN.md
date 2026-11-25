@@ -5,10 +5,11 @@ Port of `go.arpabet.com/value-rpc` (Go) to Java on top of `com.arpabet:value`
 `@arpabet/vrpc` (value-rpc-js).
 
 Status: the protocol core, the client and its transports over TCP and in
-memory, the resilience policies and the QUIC transport are written and pass
-against the Go implementation; the rest is as planned below. Written
-2026-11-24; revised the same day after the decisions and after the upstream
-fixes of §6 were released, and on 2026-11-25 when resilience and QUIC were
+memory, the resilience policies, the QUIC transport, the server and a
+WebSocket listener are written and pass against the Go implementation; the
+rest is as planned below. Written 2026-11-24; revised the same day after the
+decisions and after the upstream fixes of §6 were released, and on 2026-11-25
+when resilience and QUIC, and then the server and the WebSocket listener, were
 added ahead of their place in the plan, on request.
 
 ## Progress
@@ -32,9 +33,11 @@ changelog and in `StreamRules` of the Go implementation as of v1.7.2.
 | 10 Resilience (ahead of its place) | done | module `value-rpc-resilience`, package `com.arpabet.valuerpc.resilience`: `Resilience.retry()`, `circuitBreaker()`, `timeoutMillis`, `fallback`, `bulkhead`, `rateLimit`, with the defaults and the failures of the Go module. No dependency of its own; passes the API 26 check. 65 tests: the 14 of the Go module one for one, what a client adds, and 7 against the Go server |
 | QUIC (was left out; added on request) | done, as a transport | module `value-rpc-quic`, package `com.arpabet.valuerpc.quic`, on Netty's QUIC codec 4.2.21: `QuicTransport.client`, `dialer` and `listener`, `QuicOptions`. One QUIC stream for each request, as `quic/transport.go`; ALPN `vrpc`; mutual TLS. 66 tests: the Java client against the Go QUIC server (the tests of `quic/transport_test.go`), the Go client (`conformance/client`) against the Java listener, both ends in Java. JVM only: the codec is native code. The listener waits for the server engine of phase 7 to be of use beyond the tests |
 | Release 0.1.0 (prepared 2026-11-25) | tagged once and not released (below the table); to tag again when the build on GitHub is green | version `0.1.0`; the three modules published together (`vrpc.publish` in `buildSrc`, `centralBundle` at the root, `.github/workflows/release.yaml` on a tag `v*`, with the four secrets of value-java); `CHANGELOG.md`, `RELEASE.md`; the licence in every jar. Tested against value-rpc **v1.7.2** (against v1.7.1 when it was prepared) and against `com.arpabet:value` 0.3.0 from Maven Central; signing and the bundle rehearsed with a throwaway key; the jars reproducible; the staged artifacts used from a project of their own against the Go server. It is the client only, earlier than phase 6 had it: without a `tls://` transport (TLS is by a socket of the application's own, which is tested and in the README), WebSocket, and the client as a peer |
-| 5 and later | see below | |
+| 7 Server engine (ahead of its place, 2026-11-25) | done, in the working tree, for review; not released | package `com.arpabet.valuerpc.server`: `VrpcServer` and its builder, `Authenticator`, `ConnectAuthorizer`, `ServerListener`; in the core package `Registrar`, the four handler interfaces and `RequestContext`. Accept with a connection cap and a connect-authorizer, the handshake of A.4, sessions with resume, replace and reaping, a sender for each connection that coalesces, dispatch, the four patterns with their flow control, deadlines of calls, cancellation that interrupts the handler, the limits of requests and of streams, closing that writes what is queued. Over every listener: TCP, `mem://`, WebSocket, and a listener of one's own. 30 scenarios of its own, each over TCP, `mem://` and WebSocket in both codecs (`ServerTest`), and 5 with the Go client over TCP and WebSocket in both codecs (`GoClientInteropTest`: calls, argument checks, metadata, the credential, 10,000 values to the client, 5,000 from it, chats, deadlines, cancellation, a dropped connection resumed). The conformance suite of value-rpc-js, pointed at `ConformanceServer` by hand: 15 of 19 scenarios in each codec, the other 4 being reverse calls. Not ported one for one: the Go tests of `valueserver`; what they hold is in `ServerTest` by behaviour. Not there: the engine is not the one symmetric engine of §5.3 yet. The responder is `ServerImpl.Serving`, written for the server, with what A.9 says a client does otherwise left for phase 4, which is to lift it out for both |
+| 9 WebSocket server (in part, 2026-11-25) | a listener in the core, on plain sockets; not released. The Netty module is as planned | `Transports.webSocketListener`, `ws://` as the address of a listener, `WebSocketOptions`: the server side of RFC 6455 on a socket with a thread for each connection, as the TCP listener is. Both codecs by subprotocol as A.10 has it, origins (same origin, and patterns), a ping for a silent connection, the closing handshake, the frame limit. No TLS, no compression. D5 put the WebSocket server on Netty so that the core stays free of dependencies; this one needs none, and is what a tool or a test needs. Netty is still what a server with many connections wants. 9 scenarios against a socket of the test's own (`WebSocketListenerTest`), and the WebSocket clients of the JDK, of Go (`coder/websocket`) and of Node in the tests above |
+| 5, 6, 8 and later | see below | |
 
-How to run: `./gradlew build` (226 tests in three modules). The ones against the Go implementation build
+How to run: `./gradlew build` (270 tests in three modules). The ones against the Go implementation build
 `conformance/server` and `conformance/client` and are skipped without a Go toolchain.
 `cd conformance && go run ./golden` writes the fixtures again.
 
@@ -73,6 +76,35 @@ What the two modules needed elsewhere:
 - `conformance/`: the Go server also listens on QUIC (a listener as it comes, one that allows eight requests
   at once, one with mutual TLS; a certificate authority made when it starts) and has a `flaky` function;
   `conformance/client` is the Go client over QUIC as a program.
+
+Where the server differs from the Go one. None of it is on the wire in a way a client has to know of:
+
+- **The requests of a client end with the connection they came on.** When a connection is lost, or its client
+  comes back on another, the Go server keeps the forward requests of the session: their handlers run on, and
+  a stream stays until the session ends (F5). Here they are cancelled at once and their handlers interrupted.
+  A client has failed them on its side by then, in all three implementations, and ids are not used again
+  after a reconnect. A handler here holds a thread, where a Go one holds a goroutine.
+- **A request is known before its handler runs.** It is registered on the thread that reads, so a cancel that
+  comes right behind a request finds it; in Go the handler registers it, and a cancel that is quicker is lost.
+- **A handler of a stream stays until the stream is over** (§5.5), and `StreamReady` is sent when it first
+  takes or sends, or returns. The credit of a stream from the client is sent before the handler runs, as in
+  Go. A handler that returns before the end of a stream from the client has the client sent a
+  `CancelRequest`: Go has no such case, since its handler returns at once, and leaves a client whose values
+  nobody reads waiting for credit.
+- **A call the client cancelled is not answered**, and neither is one whose connection is gone. Go sends the
+  answer of the handler, which the client drops.
+- **A handler that was interrupted answers as the Go one that returns the error of its context**:
+  `DeadlineExceeded` with `context deadline exceeded` when its time had passed, `Canceled` with
+  `context canceled` otherwise.
+- **What the thread that reads has to answer itself is not waited for**: the refusal of a request beyond the
+  limit, of an id that is not positive, of a stream that overran its credit. It is dropped when the send
+  queue of the client is full, where the Go read loop waits for room.
+- **Metrics**: a stream that is refused is reported, with its code; Go reports the streams it took.
+- **A session retention of 0 keeps no session**; in Go 0 is the default, and a negative one keeps them for good
+  in both.
+- **The WebSocket listener**: a silent connection is pinged, where Go pings every 15 s whatever is said; a
+  close from this side waits up to a second for the close of the peer before the socket is closed; an origin
+  pattern knows `*` and `?` and not the character classes of `path.Match`; there is no compression to agree on.
 
 Differences from the Go implementation found so far. On input no peer sends:
 
@@ -494,9 +526,9 @@ side follows.
 | 4 | Client as a peer | the client serves the calls and streams the server opens on it (negative ids, inbound cap, cancel propagation) | reverse.call / pull / push against the Go server, also after a resume; ports of `reverse_id_test` and the client half of the reverse tests | M |
 | 5 | WebSocket client, JSON codec | the client side of RFC 6455 over the TCP and TLS transports; subprotocol offered and required; the JSON wire codec | every scenario of phases 3 and 4 against the Go WebSocket server in both codecs, `ws` and `wss` | M |
 | 6 | Android, and a first release | an Android example app; the R8 rules; the scenarios run on an API 26 emulator and on a current one; `Typed` helpers and the `ValueCodec` bridge; README | **`com.arpabet:value-rpc:0.1.0`: the client**, on Android 8+ and JVM 17+ | M |
-| 7 | Server engine | accept loop with backoff, connection cap, connect-authorizer, handshake, authenticator and principal, session registry, resume/replace, session reaping, sender with coalescing and close-flush, dispatch, request context, the four patterns, request/stream limits, handler-failure isolation, graceful close; over TCP, TLS and `mem://` on sockets | **Go client ↔ Java server**, all scenarios; Java ↔ Java matrix; ports of `integration_test` (39), `session_test`, `session_reap_test`, `server_close_flush_test`, `sender_flush_test`, `client_close_test` | L |
+| 7 | Server engine (**done 2026-11-25**, ahead of its place; see Progress) | accept loop with backoff, connection cap, connect-authorizer, handshake, authenticator and principal, session registry, resume/replace, session reaping, sender with coalescing and close-flush, dispatch, request context, the four patterns, request/stream limits, handler-failure isolation, graceful close; over TCP, TLS and `mem://` on sockets | **Go client ↔ Java server**, all scenarios; Java ↔ Java matrix; ports of `integration_test` (39), `session_test`, `session_reap_test`, `server_close_flush_test`, `sender_flush_test`, `client_close_test` | L |
 | 8 | Server as a peer | the server-side `Peer` handle: reverse calls and streams toward a client, fail-fast on reconnect, establish timeout | reverse scenarios in every pairing; ports of the `reverse_*` and hardening tests. Mostly wiring, the engine being symmetric since phase 3 | S–M |
-| 9 | `value-rpc-netty` | WebSocket server (both codecs, origins, ping, limits, `wss`), mountable in a pipeline of your own; TCP, TLS and Unix listeners on event loops | transport matrix over every transport; Go and JS WebSocket clients against the Java server in both codecs (**the value-rpc-js conformance suite, 19 scenarios × 2 codecs, pointed at Java**) | L |
+| 9 | `value-rpc-netty` (a WebSocket listener on plain sockets is in the core since 2026-11-25; see Progress) | WebSocket server (both codecs, origins, ping, limits, `wss`), mountable in a pipeline of your own; TCP, TLS and Unix listeners on event loops | transport matrix over every transport; Go and JS WebSocket clients against the Java server in both codecs (**the value-rpc-js conformance suite, 19 scenarios × 2 codecs, pointed at Java**) | L |
 | 10 | Resilience, examples, docs | `value-rpc-resilience` (**done 2026-11-25**); the 12 examples of the Go repo; `PROTOCOL.md` | examples run against both servers; ports of `resilience` tests (done) | M |
 | — | QUIC (added 2026-11-25) | `value-rpc-quic`: client builder, dialer and listener on Netty's QUIC codec (**done**); `valuequic.NewServer` as one call comes with the server engine | the Java client against the Go QUIC server and the Go client against the Java listener (done); the reverse tests of `quic/reverse_test.go` with phases 4 and 8 | M |
 | 11 | Hardening and release | fuzz/property tests of frame and JSON decoding; stress (10,000 concurrent unary, many streams, churn of reconnects); thread and memory leak checks after close; JMH numbers next to Go's; a CI run on virtual threads; publish the server and Netty artifacts | all of §3 holds | M |

@@ -6,9 +6,11 @@
 wire protocol of the Go implementation, which is the reference: the same
 envelopes, byte for byte, and the same conversation.
 
-The first release, 0.1.0, is the client. The server, and what else is to
-come, is in [MIGRATION_PLAN.md](MIGRATION_PLAN.md), with the decisions and the
-wire contract; [CHANGELOG.md](CHANGELOG.md) has what each release brought.
+The first release, 0.1.0, is the client. The server and its WebSocket
+listener are written and not released yet: they are what this repository
+builds now, as 0.2.0-SNAPSHOT. What else is to come is in
+[MIGRATION_PLAN.md](MIGRATION_PLAN.md), with the decisions and the wire
+contract; [CHANGELOG.md](CHANGELOG.md) has what each release brought.
 
 ## Using it
 
@@ -41,9 +43,11 @@ server over TCP, TLS and QUIC, and the Go client with the Java QUIC listener.
 | Client: the three kinds of stream, with credit-based flow control | done; checked against the Go server |
 | Resilience: retry, circuit breaker, timeout, fallback, bulkhead, rate limit (`value-rpc-resilience`) | done; the tests of the Go module, and checked against the Go server |
 | QUIC transport: a dialer for a client, a listener for a server (`value-rpc-quic`) | done; checked against the Go server and the Go client. For a JVM, not for Android |
+| Server: calls and the three kinds of stream with their flow control, deadlines, cancellation, metadata, an authenticator and a connect-authorizer, sessions that a client resumes, limits, closing that writes what is queued | done, not released; checked against the Go client and against the JS client (`@arpabet/vrpc`) |
+| WebSocket listener, for browsers: both codecs by subprotocol, origins, ping, the close (in the core, on plain sockets) | done, not released; checked against the WebSocket clients of the JDK, of Go and of Node |
 | Client: serving the calls and streams a server opens on it; replay of calls after a reconnect | not yet |
-| A `tls://` transport of the library's own; WebSocket | not yet |
-| Server | not yet |
+| Server: calling its clients | not yet |
+| A `tls://` transport of the library's own; a WebSocket client; `wss://`; a WebSocket listener on Netty, for many connections | not yet |
 
 ## A call
 
@@ -71,6 +75,108 @@ client.close();
 A client connects when it is first used and again when its connection is lost;
 it then shows the server the next link of its hash chain, and the server takes
 it for the same session.
+
+## A server
+
+```java
+VrpcServer server = VrpcServer.builder()
+        .address("tcp://0.0.0.0:9000")                 // or ws://0.0.0.0:9000/rpc, or mem://name
+        .authenticator((conn, credential) -> userOf(credential))   // throws to refuse; what it returns is the principal
+        .build();
+
+server.addFunction("greet", (context, args) ->
+        Value.utf8("Hello, " + ((ListValue) args).get(0) + "!"));
+
+server.addFunction("user.get", TypeDef.list(TypeDef.NUMBER), TypeDef.ANY, (context, args) -> {
+    User user = users.find(((ListValue) args).getNumber(0).longValue(), context.principal());
+    if (user == null) {
+        throw new VrpcException(Code.NOT_FOUND, "no such user");    // the code the caller sees
+    }
+    return user.toValue();
+});
+
+// a stream to the client: send() waits while the client has no room
+server.addOutgoingStream("events.tail", TypeDef.ANY, (context, args, out) -> {
+    try (Subscription events = bus.subscribe(args)) {
+        for (Value event = events.take(); event != null; event = events.take()) {
+            out.send(event);
+        }
+    }
+});                                                    // returning ends the stream
+
+// a stream from the client: taking a value is what lets the client send another
+server.addIncomingStream("logs.upload", TypeDef.ANY, (context, args, in) -> {
+    for (Value line : in) {
+        store(line);
+    }
+});
+
+// both at once
+server.addChat("support.chat", TypeDef.ANY, (context, args, in, out) -> {
+    for (Value said : in) {
+        out.send(answer(said));
+    }
+});
+
+server.start();
+// ...
+server.close();                                        // writes the answers that are queued, then closes
+```
+
+A handler runs on a thread of its own for as long as its request lasts, and
+may wait. It is told about its request by its `RequestContext`: who asks
+(`principal()`, what the authenticator returned), what travels with the
+request (`metadata()`), how long the caller still waits (`remainingMillis()`,
+of a call), and whether anyone still waits at all (`isCancelled()`,
+`onCancel`). When the client cancels a request, when the time of a call has
+passed, when the connection is lost and when the server closes, the thread of
+the handler is interrupted, so a handler that waits is woken; what it was
+sending to or taking from fails with a `VrpcException` that says why.
+
+Where the Go handler of a stream returns a channel and leaves a goroutine
+behind, the handler here stays until the stream is over, and the stream ends
+when it returns. The client is told that its stream is taken when the handler
+first sends or takes, or returns; a handler that throws before that refuses
+the stream, as a Go handler does by returning an error.
+
+A client that reconnects is the same session when it is the same principal
+and shows the next link of its hash chain: an id alone, which anyone can send,
+takes over nobody's session. What a client had asked on the connection it
+lost is cancelled, since the client has given it up too. The session of a
+client that does not come back is dropped after two minutes.
+
+What a server does not do yet is call its clients: the reverse direction is
+not served by the client of this library either.
+
+## WebSocket
+
+A browser has no socket, and connects to a WebSocket listener: the client
+there is [`@arpabet/vrpc`](https://github.com/arpabet/value-rpc-js).
+
+```java
+VrpcServer server = VrpcServer.builder().address("ws://0.0.0.0:9000/rpc").build();
+
+// set up otherwise than by default
+Listener listener = Transports.webSocketListener("0.0.0.0:9000/rpc", TransportOptions.DEFAULT,
+        WebSocketOptions.DEFAULT
+                .withOriginPatterns("app.example.com")     // the pages that may connect, besides the server's own
+                .withCodecs(WireCodec.JSON)                // one codec only; both by default
+                .withPingIntervalMillis(30_000));
+VrpcServer server = VrpcServer.builder().listen(listener).build();
+```
+
+A message is one WebSocket message: MessagePack in a binary frame, or JSON in
+a text frame for a client that offers the subprotocol `vrpc.json`. A browser
+says which page opened a connection, and a page of another site is refused
+unless a pattern lets it in; a client that is not a browser sends no origin
+and is not held to this. A connection that is silent is sent a ping, and is
+closed when it does not answer.
+
+The listener is in the core, on plain sockets, with a thread for each
+connection, as the TCP listener: enough for the tools and the services of a
+team, and for tests. It does not serve TLS (put it behind what ends TLS for
+the site), and takes no compression. A listener on Netty, for many
+connections, is still to come, as is a WebSocket client.
 
 ## Streams
 
@@ -210,14 +316,23 @@ comes from Maven Central, as it does for a release.
 The tests that run against the Go implementation need a Go toolchain (1.25 or
 newer) and are skipped without one. They build `conformance/server`, a real
 value-rpc server on TCP, TLS, WebSocket and QUIC, and `conformance/client`,
-the Go client over QUIC, and talk to them.
+the Go client over QUIC, TCP and WebSocket, and talk to them: the Java client
+to the Go server, and the Go client to the Java server.
 
 ```sh
 cd conformance
 go run ./golden          # writes the fixtures of value-rpc/src/test/resources/golden again
 go run ./server          # the Go server the tests talk to, by hand
 go run ./client -quic 127.0.0.1:9000 -ca ca.pem calls    # the Go client, against a QUIC listener
+go run ./client -ws ws://127.0.0.1:9001/rpc -codec json calls streams upload:1000 chat
+
+cd .. && ./gradlew :value-rpc:conformanceServer    # the Java twin of the Go server, on TCP and WebSocket
 ```
+
+The Java twin has the functions of the Go server, but for the calls a server
+makes back to its client. It is what the conformance suite of value-rpc-js
+runs against when it is given the URL of a server in place of starting the Go
+one.
 
 Two workflows run on GitHub. `build.yaml` builds and tests every push on JDK
 17 and 21, checks that the committed fixtures are what the generator writes,
@@ -232,7 +347,7 @@ same sources give the same bytes.
 ## Layout
 
 ```
-value-rpc/              the library: com.arpabet.valuerpc (protocol), .client, .transport
+value-rpc/              the library: com.arpabet.valuerpc (protocol), .client, .server, .transport
 value-rpc-resilience/   com.arpabet.valuerpc.resilience: the policies
 value-rpc-quic/         com.arpabet.valuerpc.quic: the QUIC transport, on Netty
 buildSrc/               what the builds of the modules have in common

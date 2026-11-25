@@ -18,6 +18,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <pre>
  *   host:port, tcp://host:port     TCP
+ *   ws://host:port/path            WebSocket, to listen on: what a browser connects to
  *   mem://name                     inside this process
  * </pre>
  *
@@ -52,6 +53,8 @@ public final class Transports {
                 return new Tcp.TcpDialer(a[1], options);
             case "mem":
                 return Mem.dialer(a[1]);
+            case "ws":
+                return failing("ws:// is listened on and not dialed yet: a client of this library reaches a server over tcp://");
             case "quic":
                 return failing("quic:// is provided by the separate module com.arpabet:value-rpc-quic (QuicTransport.dialer)");
             default:
@@ -69,12 +72,27 @@ public final class Transports {
                 return Tcp.listen(a[1], options);
             case "mem":
                 return Mem.listen(a[1]);
+            case "ws":
+                return Ws.listen(a[1], options, WebSocketOptions.DEFAULT);
             case "quic":
                 throw new IOException(
                         "quic:// is provided by the separate module com.arpabet:value-rpc-quic (QuicTransport.listener)");
             default:
                 throw new IOException("unsupported listen network " + a[0] + " in address " + address);
         }
+    }
+
+    /**
+     * A WebSocket listener that is set up otherwise than by default: with
+     * the origins browsers may connect from, with one codec only, with
+     * another ping.
+     *
+     * @param address {@code host:port/path}, with or without {@code ws://}
+     *                before it; the path is {@code /} when it has none
+     */
+    public static Listener webSocketListener(String address, TransportOptions options, WebSocketOptions webSocket)
+            throws IOException {
+        return Ws.listen(address.startsWith("ws://") ? address.substring(5) : address, options, webSocket);
     }
 
     private static Dialer failing(String why) {

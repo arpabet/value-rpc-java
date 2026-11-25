@@ -111,7 +111,7 @@ final class Tcp {
         }
     }
 
-    /** Accepts sockets on a thread of its own and hands each to {@link #accepted}. */
+    /** Accepts sockets on a thread of its own and has {@link #accepted} make a connection of each. */
     abstract static class SocketListener implements Listener {
         private final ServerSocket server;
         private final String scheme;
@@ -123,8 +123,13 @@ final class Tcp {
             this.scheme = scheme;
         }
 
-        /** The connection of an accepted socket; what it throws drops that socket only. */
-        abstract MsgConn accepted(Socket socket) throws IOException;
+        /**
+         * Makes the connection of an accepted socket and hands it to the
+         * acceptor, at once or when the socket has been made ready on another
+         * thread: this one accepts, and must not wait. What it throws drops
+         * that socket only.
+         */
+        abstract void accepted(Socket socket, Acceptor acceptor) throws IOException;
 
         @Override
         public void start(Acceptor acceptor) {
@@ -156,7 +161,7 @@ final class Tcp {
                     continue;
                 }
                 try {
-                    acceptor.onConnection(accepted(socket));
+                    accepted(socket, acceptor);
                 } catch (IOException | RuntimeException e) {
                     try {
                         socket.close();
@@ -202,9 +207,9 @@ final class Tcp {
         }
         return new SocketListener(server, "tcp") {
             @Override
-            MsgConn accepted(Socket socket) throws IOException {
+            void accepted(Socket socket, Acceptor acceptor) throws IOException {
                 tune(socket, options);
-                return conn(socket, options);
+                acceptor.onConnection(conn(socket, options));
             }
         };
     }

@@ -20,6 +20,18 @@ tasks.test {
     providers.gradleProperty("goldenDir").orNull?.let { systemProperty("valuerpc.golden.dir", it) }
 }
 
+// The Java twin of conformance/server as a program, for the clients of the
+// other implementations to be tried against by hand: it prints where it
+// listens, on TCP and on WebSocket, and ends when its standard input does.
+//   ./gradlew :value-rpc:conformanceServer
+tasks.register<JavaExec>("conformanceServer") {
+    group = "verification"
+    description = "Runs the conformance server of this implementation, on TCP and on WebSocket."
+    classpath = sourceSets["testFixtures"].runtimeClasspath
+    mainClass.set("com.arpabet.valuerpc.ConformanceServer")
+    standardInput = System.`in`
+}
+
 tasks.jar {
     manifest {
         attributes("Automatic-Module-Name" to "com.arpabet.valuerpc")

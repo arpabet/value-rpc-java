@@ -12,6 +12,7 @@
 // it is ready, and one when all of them are,
 //
 //	LISTENING tcp 127.0.0.1:53124
+//	LISTENING tls 127.0.0.1:53129
 //	LISTENING ws 127.0.0.1:53125/rpc
 //	LISTENING quic 127.0.0.1:53126
 //	LISTENING quic-small 127.0.0.1:53127
@@ -21,8 +22,8 @@
 //	TLS client-key <its key, PKCS #8 in base64>
 //	READY
 //
-// and exits when its standard input ends. The QUIC listeners have a
-// certificate for 127.0.0.1 and localhost that the authority signed, made
+// and exits when its standard input ends. The TLS and the QUIC listeners have
+// a certificate for 127.0.0.1 and localhost that the authority signed, made
 // when the server starts. "quic-small" allows eight requests at once on a
 // connection, so that a stream that is not freed is soon missed; "quic-mtls"
 // wants a certificate of the client.
@@ -72,6 +73,11 @@ func main() {
 	if err != nil {
 		fail("certificates", err)
 	}
+	tlsSrv, err := valueserver.NewTLSServer(env("VRPC_TLS_ADDR", "127.0.0.1:0"),
+		&tls.Config{Certificates: []tls.Certificate{pki.server}}, logger)
+	if err != nil {
+		fail("bind tls", err)
+	}
 	quicAddr := env("VRPC_QUIC_ADDR", "127.0.0.1:0")
 	quic, err := valuequic.NewServer(quicAddr, &tls.Config{Certificates: []tls.Certificate{pki.server}}, logger)
 	if err != nil {
@@ -95,7 +101,7 @@ func main() {
 	}
 
 	state := &shared{}
-	servers := []valueserver.Server{tcp, ws, quic, quicSmall, quicMTLS}
+	servers := []valueserver.Server{tcp, tlsSrv, ws, quic, quicSmall, quicMTLS}
 	for _, srv := range servers {
 		register(srv, state)
 		go func(srv valueserver.Server) {
@@ -106,6 +112,7 @@ func main() {
 	}
 
 	fmt.Printf("LISTENING tcp %s\n", tcp.Addr().String())
+	fmt.Printf("LISTENING tls %s\n", tlsSrv.Addr().String())
 	fmt.Printf("LISTENING ws %s/rpc\n", ws.Addr().String())
 	fmt.Printf("LISTENING quic %s\n", quic.Addr().String())
 	fmt.Printf("LISTENING quic-small %s\n", quicSmall.Addr().String())
@@ -414,6 +421,22 @@ func register(srv valueserver.Server, state *shared) {
 				case out <- value.Utf8("echo:" + v.String()):
 				case <-ctx.Done():
 					return
+				}
+			}
+		}()
+		return out, nil
+	})
+
+	// Takes what the client sends, counts it as "upload" does, and says
+	// nothing: its side of the chat ends at once, and the client's goes on.
+	srv.AddChat("chat.sink", any, func(ctx context.Context, args value.Value, inC <-chan value.Value) (<-chan value.Value, error) {
+		out := make(chan value.Value)
+		close(out)
+		go func() {
+			for v := range inC {
+				if n, ok := v.(value.Number); ok {
+					state.sum.Add(n.Long())
+					state.count.Add(1)
 				}
 			}
 		}()

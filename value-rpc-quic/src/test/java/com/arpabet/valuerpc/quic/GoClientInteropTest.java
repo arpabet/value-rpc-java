@@ -149,10 +149,15 @@ class GoClientInteropTest {
             final X509Certificate shown = (X509Certificate) accepted.get().tlsSession().getPeerCertificates()[0];
             assertEquals("CN=vrpc-test-client", shown.getSubjectX500Principal().getName());
 
-            // One that shows none does not get in. The Go client finds out
-            // only when the time it may connect in is over, so it is given little.
-            final String refused = goClient(server.listenerAddress(), Arrays.asList("-connect-timeout", "2000"), "calls");
-            assertTrue(refused.startsWith("exit 1\nFAILED "), refused);
+            // One that shows none does not get in, and is told at once: the
+            // listener closes the connection on it, which the Go client notices
+            // since v1.7.1 and does not wait out the time it may connect in.
+            final long start = System.nanoTime();
+            final String refused = goClient(server.listenerAddress(), NONE, "calls");
+            final long took = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+            assertTrue(refused.startsWith("exit 1\nFAILED connect"), refused);
+            assertTrue(refused.contains("certificate required"), refused);
+            assertTrue(took < 5000, "the refusal took " + took + " ms to reach the Go client");
             assertEquals(1, server.connections());
         }
     }

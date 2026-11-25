@@ -88,6 +88,9 @@ final class QuicConn implements MsgConn {
      */
     private static final long PEER_END_WAIT_MILLIS = 250;
 
+    /** {@link #PEER_END_WAIT_MILLIS}, as a test may set it to have room around it. */
+    static volatile long peerEndWaitMillis = PEER_END_WAIT_MILLIS;
+
     private final QuicChannel channel;
     private final EventLoop loop;
     private final boolean client;
@@ -584,7 +587,7 @@ final class QuicConn implements MsgConn {
                 }
                 st = open(o.rid, o.type);
             }
-            o.last = o.type != null && StreamRules.finOnWrite(st.originatedHere, o.type);
+            o.last = o.type != null && StreamRules.finOnWrite(st.originatedHere, o.type, st.request);
             send(st, o, touched);
         }
         for (QuicStreamChannel ch : touched) {
@@ -681,7 +684,7 @@ final class QuicConn implements MsgConn {
         if (ch.isInputShutdown()) {
             writeEnd(st, ch);
         } else {
-            st.endWaits = loop.schedule(() -> writeEnd(st, ch), PEER_END_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+            st.endWaits = loop.schedule(() -> writeEnd(st, ch), peerEndWaitMillis, TimeUnit.MILLISECONDS);
         }
     }
 

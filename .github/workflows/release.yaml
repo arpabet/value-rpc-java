@@ -1,0 +1,183 @@
+name: Release
+
+# Publishes the modules of value-rpc-java to Maven Central, together and in
+# one version, and cuts a GitHub Release:
+#
+#   com.arpabet:value-rpc             the protocol, the client, the transports
+#   com.arpabet:value-rpc-resilience  the policies of a client
+#   com.arpabet:value-rpc-quic        the QUIC transport
+#
+# Trigger: push a version tag (v0.1.0) whose number is the `version` of
+# build.gradle.kts. The release is built, tested, signed, uploaded to the
+# Central Portal and published; then the GitHub Release is made, with the jars.
+#
+# Or run it by hand from the Actions UI. That only stages the release, unless
+# "publish" is ticked: the bundle is uploaded and validated, and then waits at
+# https://central.sonatype.com/publishing/deployments to be published or
+# dropped there. It is the way to try the setup below without consequences,
+# since what reaches Maven Central can never be changed or removed.
+#
+# A version that is on Maven Central already is not uploaded again, so the
+# workflow is safe to re-run after a partial failure.
+#
+# The secrets it uses are the four value-java releases with, by the same
+# names:
+#
+#   MAVEN_CENTRAL_USERNAME, MAVEN_CENTRAL_PASSWORD
+#       the two halves of a user token of the Central Portal account that
+#       holds the namespace com.arpabet (central.sonatype.com: Account,
+#       Generate User Token)
+#   SIGNING_KEY, SIGNING_PASSWORD
+#       the PGP key the artifacts are signed with, ASCII-armored
+#       (gpg --armor --export-secret-keys <key id>), and its passphrase; its
+#       public half is on a key server that Maven Central reads
+#
+# The secrets of a repository are its own: the ones of value-java are not seen
+# here. They are set for this repository as well (Settings, Secrets and
+# variables, Actions; or `gh secret set NAME --repo arpabet/value-rpc-java`),
+# or once for the organization, with this repository among those that may use
+# them. The workflow says which are missing before it builds anything.
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to Maven Central (unticked, the release is only staged in the Portal)
+        type: boolean
+        default: false
+
+permissions:
+  # To create the GitHub Release.
+  contents: write
+
+# One release at a time, and never cut short.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # go.arpabet.com modules are fetched from their source, not from Google's
+  # module proxy.
+  GOPRIVATE: go.arpabet.com/*
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate the Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+
+      # No caches here: what is signed and published is built from the
+      # repository and from what the build downloads and verifies itself.
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: conformance/go.mod
+          cache: false
+
+      - name: The version to release
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(./gradlew -q properties --property version | sed -n 's/^version: //p')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Version $version"
+          case "$version" in
+            ''|*-SNAPSHOT)
+              echo "::error::'$version' is not a version to release"
+              exit 1
+              ;;
+          esac
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME is not v$version, the version of build.gradle.kts"
+            exit 1
+          fi
+          # The modules go up together: when one is there, all are.
+          if curl --silent --fail --head --output /dev/null \
+              "https://repo1.maven.org/maven2/com/arpabet/value-rpc/$version/value-rpc-$version.pom"; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::com.arpabet:value-rpc:$version is on Maven Central already: nothing to upload"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Before the build, which takes minutes, and not after it.
+      - name: The secrets a release needs
+        if: steps.version.outputs.published == 'false'
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for name in MAVEN_CENTRAL_USERNAME MAVEN_CENTRAL_PASSWORD SIGNING_KEY SIGNING_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              missing="$missing $name"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::not set for this repository:$missing. They are the secrets of value-java, which a repository does not share: set them here, or for the organization."
+            exit 1
+          fi
+
+      # What is released is what passed: the build with its tests, against the
+      # Go implementation too, and the tests again against a large corpus the
+      # Go implementation writes here.
+      - name: Build and test
+        run: ./gradlew build
+
+      - name: Conformance with the Go implementation
+        run: |
+          (cd conformance && go run ./golden -out "$RUNNER_TEMP/golden" -scale 30)
+          ./gradlew test -PgoldenDir="$RUNNER_TEMP/golden"
+
+      - name: Sign and bundle
+        if: steps.version.outputs.published == 'false'
+        env:
+          ORG_GRADLE_PROJECT_signingKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingPassword: ${{ secrets.SIGNING_PASSWORD }}
+        run: ./gradlew centralBundle
+
+      - name: Upload to Maven Central
+        if: steps.version.outputs.published == 'false'
+        env:
+          CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          # A tag publishes; a run by hand stages, unless it was asked to publish.
+          PUBLISHING_TYPE: ${{ (github.ref_type == 'tag' || inputs.publish) && 'AUTOMATIC' || 'USER_MANAGED' }}
+        run: >
+          .github/scripts/central-upload.sh
+          "build/central/value-rpc-java-${{ steps.version.outputs.version }}-bundle.zip"
+          "$PUBLISHING_TYPE"
+
+      - name: GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            echo "The release $GITHUB_REF_NAME exists already"
+          else
+            # The jar of each module, with its sources and its javadoc.
+            jars=()
+            for module in value-rpc value-rpc-resilience value-rpc-quic; do
+              for kind in "" "-sources" "-javadoc"; do
+                jars+=("$module/build/libs/$module-$VERSION$kind.jar")
+              done
+            done
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes "${jars[@]}"
+          fi

@@ -146,6 +146,11 @@ public final class GoServer implements AutoCloseable {
         return address("tcp");
     }
 
+    /** The address of its TLS listener, {@code host:port}: its certificate is signed by {@link #ca()}. */
+    public String tls() {
+        return address("tls");
+    }
+
     /** The address of its WebSocket listener, {@code host:port/path}. */
     public String ws() {
         return address("ws");
@@ -172,7 +177,7 @@ public final class GoServer implements AutoCloseable {
         }
     }
 
-    /** The certificate authority that signed the certificate of the QUIC listeners. */
+    /** The certificate authority that signed the certificate of the TLS and the QUIC listeners. */
     public X509Certificate ca() {
         return certificate(tls("ca"));
     }

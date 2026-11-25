@@ -52,6 +52,14 @@ tasks.withType<AbstractArchiveTask>().configureEach {
     isReproducibleFileOrder = true
 }
 
+// The licence travels with every copy: in the jar, and in the jars of its
+// sources and of its javadoc.
+tasks.withType<Jar>().configureEach {
+    from(rootProject.file("LICENSE")) {
+        into("META-INF")
+    }
+}
+
 tasks.named<Jar>("jar") {
     manifest {
         attributes(

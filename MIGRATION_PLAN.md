@@ -13,9 +13,9 @@ added ahead of their place in the plan, on request.
 
 ## Progress
 
-The first implementation is committed (`3454d36`). What came after it, the
-two modules of 2026-11-25 and what they needed elsewhere, is in the working
-tree for review.
+Committed: the first implementation (`3454d36`) and the two modules of
+2026-11-25 (`f270558`). In the working tree, for review: what prepares the
+release of 0.1.0 (the last row of the table).
 
 | Phase | State | What is there |
 |---|---|---|
@@ -28,9 +28,10 @@ tree for review.
 | 4 Client as a peer | next | serving the calls and streams the server opens on the client; today such a request is answered `NotFound` |
 | 10 Resilience (ahead of its place) | done | module `value-rpc-resilience`, package `com.arpabet.valuerpc.resilience`: `Resilience.retry()`, `circuitBreaker()`, `timeoutMillis`, `fallback`, `bulkhead`, `rateLimit`, with the defaults and the failures of the Go module. No dependency of its own; passes the API 26 check. 65 tests: the 14 of the Go module one for one, what a client adds, and 7 against the Go server |
 | QUIC (was left out; added on request) | done, as a transport | module `value-rpc-quic`, package `com.arpabet.valuerpc.quic`, on Netty's QUIC codec 4.2.21: `QuicTransport.client`, `dialer` and `listener`, `QuicOptions`. One QUIC stream for each request, as `quic/transport.go`; ALPN `vrpc`; mutual TLS. 66 tests: the Java client against the Go QUIC server (the tests of `quic/transport_test.go`), the Go client (`conformance/client`) against the Java listener, both ends in Java. JVM only: the codec is native code. The listener waits for the server engine of phase 7 to be of use beyond the tests |
+| Release 0.1.0 (prepared 2026-11-25) | ready to tag | version `0.1.0`; the three modules published together (`vrpc.publish` in `buildSrc`, `centralBundle` at the root, `.github/workflows/release.yaml` on a tag `v*`, with the four secrets of value-java); `CHANGELOG.md`, `RELEASE.md`; the licence in every jar. Tested against value-rpc **v1.7.1** and against `com.arpabet:value` 0.3.0 from Maven Central; signing and the bundle rehearsed with a throwaway key; the jars reproducible; the staged artifacts used from a project of their own against the Go server. It is the client only, earlier than phase 6 had it: without a `tls://` transport (TLS is by a socket of the application's own, which is tested and in the README), WebSocket, and the client as a peer |
 | 5 and later | see below | |
 
-How to run: `./gradlew build` (212 tests in three modules). The ones against the Go implementation build
+How to run: `./gradlew build` (225 tests in three modules). The ones against the Go implementation build
 `conformance/server` and `conformance/client` and are skipped without a Go toolchain.
 `cd conformance && go run ./golden` writes the fixtures again.
 
@@ -57,8 +58,10 @@ In the QUIC transport, none of which a peer has to know of:
   message that ends the request for both sides, a failure or a cancellation, whoever sent it and whatever the
   request: by Go's rules the half stays open in some of those cases (a chat, or a stream to the peer, that
   the peer fails; a request the peer cancels), and the stream then lasts as long as the connection. This
-  is read from `finOnWrite` and `finOnRead`, not measured. `StreamRules` has both sets of rules, and
-  `StreamRulesTest` says which is which.
+  is read from `finOnWrite` and `finOnRead`, not measured. And **the side that opened a chat does not end
+  its half with the end of what it streams**, as Go does, but when the peer ends the chat: until then it
+  has to grant the peer credit (see the third finding below, which was measured). `StreamRules` has both
+  sets of rules, and `StreamRulesTest` says which is which.
 - **A message for a request that is over** (a credit that was on its way): Go opens a new stream for it when
   the id is one it owns, and fails the write otherwise; here it is dropped, and a stream is opened only by the
   message that opens a request.
@@ -72,22 +75,20 @@ In the QUIC transport, none of which a peer has to know of:
 - **A request that is one too many** for the streams the peer allows waits for one, as in Go, but no longer
   than the write timeout of the transport; then the connection is given up and made again. Go waits for good.
 
-Two things found on the way that are not differences but should be known:
+Three things found on the way that are not differences but should be known:
 
-- **In the Go QUIC transport a connection the peer closed is not noticed by the reader.**
+- **In the Go QUIC transport, up to v1.7.0, a connection the peer closed was not noticed by the reader.**
   `quicMsgConn.ReadMessage` waits on its queue, on its own `done` and on the read deadline, and not on the
   QUIC connection. A Go client without a certificate against the Go server that wants one takes the whole
   dial timeout, 30 s, and fails with `handshake: i/o timeout`, where this client is refused in a tenth of a
   second; reproduced with Go on both ends (`conformance/client` against the `quic-mtls` listener of
   `conformance/server`). After the handshake the response loop reads without a deadline, so a client that
-  only waits would not learn that its connection is gone until it writes. **Fixed on 2026-11-25 in the
-  working tree of value-rpc** (`quic/transport.go`, tests in `quic/closed_conn_test.go`, an entry in its
-  changelog), on request; not committed and not released. `ReadMessage` now ends when the connection has
-  ended and the stream readers have handed over what they had read. The refused client fails in
-  milliseconds with the reason, and an idle client reconnects; the Java QUIC tests pass against the fixed
-  transport as well (run once with a `go.work` in `conformance/` that points at the checkout). The
-  conformance module here pins v1.7.0, which does not have the fix, so the Go client of the tests is still
-  given little time to connect where it is to be refused (`-connect-timeout`).
+  only waits would not learn that its connection is gone until it writes. **Fixed on 2026-11-25 in
+  value-rpc, on request, and released as v1.7.1** (`quic/transport.go`, tests in
+  `quic/closed_conn_test.go`): `ReadMessage` now ends when the connection has ended and the stream readers
+  have handed over what they had read. The refused client fails in milliseconds with the reason, and an
+  idle client reconnects. The conformance module here pins v1.7.1, and the test of a Go client that is
+  refused asserts that it is told at once.
 - **Netty's QUIC codec (quiche underneath) can lose the end of a half of a stream that is sent by itself.**
   What was seen, in the packet logs of both ends: of 41 ends that were written to the codec, and accepted by
   it, 3 were sent; the 38 others were written while the codec was working through packets that had arrived
@@ -99,6 +100,20 @@ Two things found on the way that are not differences but should be known:
   be left is narrow, and was not seen: a peer that ends its half more than a quarter of a second after its
   last message, together with the loss of the packet that carried this side's end, would leave that one
   stream open at the peer until the connection ends. Worth reporting to Netty.
+- **In the Go QUIC transport, v1.7.1 included, a chat stops for good after one window of credit once the
+  side that opened it has sent its last.** `finOnWrite` ends the half of whoever made the request with its
+  `StreamEnd`, whatever the request (its `reqType` is not looked at). In a chat the peer still streams
+  after that, and the side that ended has to grant it credit: with its half ended, `WriteMessage` drops the
+  credit ("the write half may already be FIN'd ... swallow it"), and the peer stops after the values it had
+  credit for. Measured with Go on both ends: a client that sends 6000 values on `chat.echo`, ends, and then
+  reads gets all 6000 back over TCP and 4096 over QUIC, the default window, and no more
+  (`conformance/client -tcp <addr> chatend:6000` against `-quic <addr> -ca ca.pem chatend:6000`). Here it
+  showed as a chat of 10,000 values that hung in two of eight runs on a machine kept busy, since it takes
+  a reader that falls behind. **This side does otherwise** (above), and with that a Java client gets all
+  of it from a Go server, 10,000 of 10,000. What it cannot mend: a Go client that ends its side of a chat
+  first drops its own credit, whatever the server. The fix in Go is the same rule: in `finOnWrite`, not to
+  end the half for a `StreamEnd` of a chat the side opened, and in `finOnRead`, to end it when the peer's
+  `StreamEnd` of that chat is read. Not changed there.
 
 ## 1. Summary
 

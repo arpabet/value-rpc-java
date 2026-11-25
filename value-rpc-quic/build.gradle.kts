@@ -1,5 +1,6 @@
 plugins {
     id("vrpc.library")
+    id("vrpc.publish")
 }
 
 description = "QUIC transport for vRPC, on Netty: the Java implementation of go.arpabet.com/value-rpc/quic"

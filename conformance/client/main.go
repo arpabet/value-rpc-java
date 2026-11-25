@@ -4,8 +4,8 @@
  */
 
 // Command client is the Go implementation as a client, for the tests of what
-// the Java one serves: it connects over QUIC to the address it is given, runs
-// the scenarios it is given, and says how each went,
+// the Java one serves: it connects to the address it is given, over QUIC or
+// over TCP, runs the scenarios it is given, and says how each went,
 //
 //	OK calls
 //	OK sequential 50
@@ -13,12 +13,14 @@
 // or, for the first that fails, what failed, and exits with 1.
 //
 //	client -quic 127.0.0.1:9000 -ca ca.pem calls sequential:50 concurrent:16x25 big:1048576
+//	client -tcp 127.0.0.1:9001 chatend:6000
 //
-// With -cert and -key it shows the server a certificate; -timeout and
+// With -cert and -key it shows a QUIC server a certificate; -timeout and
 // -connect-timeout bound a call and connecting.
 //
 // The server has to have the functions of the test server of the Java
-// implementation: greet, echo and fail.
+// implementation: greet, echo and fail; and for chatend the chat.echo of the
+// Go conformance server.
 package main
 
 import (
@@ -41,38 +43,44 @@ import (
 
 func main() {
 	addr := flag.String("quic", "", "the address of the QUIC server, host:port")
-	caFile := flag.String("ca", "", "the certificate authority of the server, PEM")
+	tcpAddr := flag.String("tcp", "", "the address of a TCP server, host:port, in place of a QUIC one")
+	caFile := flag.String("ca", "", "the certificate authority of the QUIC server, PEM")
 	certFile := flag.String("cert", "", "a certificate to show the server, PEM")
 	keyFile := flag.String("key", "", "the key of the certificate, PEM")
 	timeout := flag.Int64("timeout", 10000, "the timeout of a call, in milliseconds")
 	connectTimeout := flag.Int64("connect-timeout", 10000, "the timeout of connecting, in milliseconds")
 	flag.Parse()
-	if *addr == "" || *caFile == "" {
-		fmt.Fprintln(os.Stderr, "usage: client -quic host:port -ca ca.pem [-cert c.pem -key k.pem] scenario...")
+	if (*addr == "" || *caFile == "") && *tcpAddr == "" {
+		fmt.Fprintln(os.Stderr, "usage: client (-quic host:port -ca ca.pem [-cert c.pem -key k.pem] | -tcp host:port) scenario...")
 		os.Exit(2)
 	}
 
-	pem, err := os.ReadFile(*caFile)
-	if err != nil {
-		fail("read the certificate authority", err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		fail("read the certificate authority", fmt.Errorf("no certificate in %s", *caFile))
-	}
-	config := &tls.Config{RootCAs: pool}
-	if *certFile != "" {
-		cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+	var cli valueclient.Client
+	var err error
+	if *tcpAddr != "" {
+		cli = valueclient.NewClient(*tcpAddr, "")
+	} else {
+		pem, err := os.ReadFile(*caFile)
 		if err != nil {
-			fail("read the certificate of the client", err)
+			fail("read the certificate authority", err)
 		}
-		config.Certificates = []tls.Certificate{cert}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			fail("read the certificate authority", fmt.Errorf("no certificate in %s", *caFile))
+		}
+		config := &tls.Config{RootCAs: pool}
+		if *certFile != "" {
+			cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+			if err != nil {
+				fail("read the certificate of the client", err)
+			}
+			config.Certificates = []tls.Certificate{cert}
+		}
+		cli = valuequic.NewClient(*addr, config)
 	}
-
-	cli := valuequic.NewClient(*addr, config)
-	// As of value-rpc v1.7.0 the Go client waits for the answer to its
-	// handshake as long as it may connect, also when the server has closed the
-	// connection on it: the time is what a test gives it.
+	// Connecting is bounded, so that a test of a server that does not answer
+	// ends. A server that refuses the client closes the connection on it, which
+	// the client learns at once (since value-rpc v1.7.1).
 	ctx, cancel := context.WithTimeout(bg, time.Duration(*connectTimeout)*time.Millisecond)
 	err = cli.ConnectContext(ctx)
 	cancel()
@@ -95,6 +103,8 @@ func main() {
 			err = concurrent(cli, number(w), number(n))
 		case "big":
 			err = big(cli, number(arg))
+		case "chatend":
+			err = chatEnd(cli, number(arg))
 		default:
 			err = fmt.Errorf("unknown scenario")
 		}
@@ -211,4 +221,40 @@ func big(cli valueclient.Client, size int) error {
 		return fmt.Errorf("echo of %d bytes came back as %d bytes", len(sent), len(got))
 	}
 	return nil
+}
+
+// chatEnd says all it has to say on a chat, ends what it sends, and only then
+// reads what came back: every value has to come back, also the ones the
+// server sends after the client has ended its side.
+func chatEnd(cli valueclient.Client, n int) error {
+	sendC := make(chan value.Value)
+	readC, _, err := cli.Chat(bg, "chat.echo", nil, 16, sendC)
+	if err != nil {
+		return err
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case sendC <- value.Long(int64(i)):
+		case <-time.After(10 * time.Second):
+			return fmt.Errorf("the server took no more after %d of %d values", i, n)
+		}
+	}
+	close(sendC)
+	count := 0
+	for {
+		select {
+		case v, ok := <-readC:
+			if !ok {
+				if count != n {
+					return fmt.Errorf("the chat ended after %d of %d values came back", count, n)
+				}
+				return nil
+			}
+			if v != nil && v.Kind() != value.NULL {
+				count++
+			}
+		case <-time.After(5 * time.Second):
+			return fmt.Errorf("stalled: %d of %d values came back", count, n)
+		}
+	}
 }

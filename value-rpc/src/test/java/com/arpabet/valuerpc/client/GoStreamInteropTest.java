@@ -231,6 +231,40 @@ class GoStreamInteropTest {
     }
 
     @Test
+    void aChatWhoseClientHasSaidItsLastStillGetsAllThatComesBack() throws Exception {
+        // The client sends all it has and ends its side before it reads
+        // anything: what comes back after that is more than the server had
+        // credit for, and the client goes on granting it.
+        final int n = 10_000;
+        try (Chat chat = client.chat("chat.echo", null, CallOptions.DEFAULT)) {
+            for (int i = 0; i < n; i++) {
+                chat.outgoing().send(Value.ofLong(i));
+            }
+            chat.outgoing().close();
+            int count = 0;
+            for (Value v = chat.incoming().take(20, TimeUnit.SECONDS); v != null; v = chat.incoming().take(20, TimeUnit.SECONDS)) {
+                assertEquals("echo:" + count, v.toString());
+                count++;
+            }
+            assertEquals(n, count);
+        }
+        assertEquals(0L, client.stats().get("pending").longValue());
+    }
+
+    @Test
+    void theServerEndingWhatItSendsEndsAChat() throws Exception {
+        // This chat's server says nothing and ends its side at once: the chat
+        // is over then, whatever the client still had to say.
+        try (Chat chat = client.chat("chat.sink", null, CallOptions.DEFAULT)) {
+            assertNull(chat.incoming().take(), "the server has ended");
+            assertEquals(0L, client.stats().get("pending").longValue(), "and the chat with it");
+            assertSame(Code.CANCELED, assertThrows(VrpcException.class, () -> chat.outgoing().send(Value.ofLong(1))).code());
+            chat.outgoing().close();
+        }
+        assertEquals(Value.utf8("Hello, after!"), client.callFunction("greet", Value.list(Value.utf8("after"))));
+    }
+
+    @Test
     void aChatUnderLoad() throws Exception {
         final int n = 20_000;
         try (Chat chat = client.chat("chat.echo", null, CallOptions.DEFAULT)) {

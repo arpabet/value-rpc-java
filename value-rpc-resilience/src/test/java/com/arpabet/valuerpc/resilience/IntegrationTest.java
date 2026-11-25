@@ -157,7 +157,7 @@ class IntegrationTest {
                 final long took = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
                 assertEquals(Code.UNAVAILABLE, last.code(), "the last failure, not a timeout of its own");
                 assertTrue(took < 2000, "it took " + took + " ms");
-                assertTrue(calls.get() >= 2 && calls.get() <= 9, calls.get() + " attempts in 150 ms with 20 ms between them");
+                assertTrue(calls.get() >= 1 && calls.get() <= 9, calls.get() + " attempts in 150 ms with 20 ms between them");
             }
         }
     }

@@ -184,7 +184,7 @@ class QuicConnTest {
     }
 
     @Test
-    void aChatWhoseServerEndsFirstStaysOpenForTheClient() throws Exception {
+    void theOneWhoAnswersAChatEndsItAndItsStreamIsFreed() throws Exception {
         try (Ends e = ends()) {
             handshake(e);
             send(e.client, request(MessageType.CHAT_REQUEST, 1, "chat"));
@@ -193,14 +193,11 @@ class QuicConnTest {
             e.atClient.next();
             e.atClient.next();
             assertEquals(D.streamEnd(id(1), null), e.atClient.next());
-            // The server has ended its half; the client's is still open.
-            Ends.awaitStreams(e.client, 1);
-            for (long v = 1; v <= 3; v++) {
-                send(e.client, D.streamValue(id(1), Value.ofLong(v)));
-                assertEquals(D.streamValue(id(1), Value.ofLong(v)), e.atServer.next());
-            }
-            send(e.client, D.streamEnd(id(1), null));
-            assertEquals(D.streamEnd(id(1), null), e.atServer.next());
+            // The server ending what it sends ends the chat, also for a client
+            // that had not said its last: nothing more is sent, by either.
+            e.awaitNoStreams();
+            send(e.client, D.streamValue(id(1), Value.utf8("too late")), D.streamEnd(id(1), null));
+            e.atServer.nothing(200);
             e.awaitNoStreams();
         }
     }
@@ -220,9 +217,42 @@ class QuicConnTest {
             for (long v = 1; v <= 3; v++) {
                 send(e.server, D.streamValue(id(1), Value.ofLong(v)));
                 assertEquals(D.streamValue(id(1), Value.ofLong(v)), e.atClient.next());
+                // The client has said its last, and still grants the server
+                // credit for what the server sends.
+                send(e.client, D.streamCredit(id(1), 1));
+                assertEquals(D.streamCredit(id(1), 1), e.atServer.next());
             }
+            Ends.awaitStreams(e.client, 1);
             send(e.server, D.streamEnd(id(1), null));
             assertEquals(D.streamEnd(id(1), null), e.atClient.next());
+            e.awaitNoStreams();
+        }
+    }
+
+    @Test
+    void aChatTheServerOpensGoesByTheSameRulesTheOtherWayRound() throws Exception {
+        try (Ends e = ends()) {
+            handshake(e);
+            send(e.server, request(MessageType.CHAT_REQUEST, -1, "chat"));
+            e.atClient.next();
+            send(e.client, D.streamReady(id(-1)));
+            e.atServer.next();
+            // The server, which opened it, says its last first, and goes on
+            // granting the client credit for what the client still sends.
+            send(e.server, D.streamValue(id(-1), Value.utf8("one")), D.streamEnd(id(-1), null));
+            e.atClient.next();
+            assertEquals(D.streamEnd(id(-1), null), e.atClient.next());
+            for (long v = 1; v <= 3; v++) {
+                send(e.client, D.streamValue(id(-1), Value.ofLong(v)));
+                assertEquals(D.streamValue(id(-1), Value.ofLong(v)), e.atServer.next());
+                send(e.server, D.streamCredit(id(-1), 1));
+                assertEquals(D.streamCredit(id(-1), 1), e.atClient.next());
+            }
+            Ends.awaitStreams(e.client, 1);
+            Ends.awaitStreams(e.server, 1);
+            // The client, which answers, ends the chat.
+            send(e.client, D.streamEnd(id(-1), null));
+            assertEquals(D.streamEnd(id(-1), null), e.atServer.next());
             e.awaitNoStreams();
         }
     }
@@ -328,19 +358,23 @@ class QuicConnTest {
     void whatIsSentAfterAHalfWasEndedIsDropped() throws Exception {
         try (Ends e = ends()) {
             handshake(e);
-            send(e.client, request(MessageType.CHAT_REQUEST, 1, "chat"));
+            // A stream to the server: with the end of what it sends, the client
+            // has nothing more to say on it, and its half is ended.
+            send(e.client, request(MessageType.PUT_STREAM_REQUEST, 1, "upload"));
             e.atServer.next();
-            send(e.server, D.streamReady(id(1)));
+            send(e.server, D.streamReady(id(1)), D.streamCredit(id(1), 8));
             e.atClient.next();
-            // The client ends its half, and then says more: that is not sent.
-            send(e.client, D.streamEnd(id(1), null), D.streamValue(id(1), Value.utf8("too late")), D.streamCredit(id(1), 4));
+            e.atClient.next();
+            send(e.client, D.streamValue(id(1), Value.utf8("one")), D.streamEnd(id(1), null));
+            e.atServer.next();
             assertEquals(D.streamEnd(id(1), null), e.atServer.next());
+            // What it is given to send after that is not sent, and fails nothing.
+            send(e.client, D.streamValue(id(1), Value.utf8("too late")), D.streamCredit(id(1), 4));
             e.atServer.nothing(200);
-            // The server's half is as it was.
-            send(e.server, D.streamValue(id(1), Value.utf8("still here")), D.streamEnd(id(1), null));
-            assertEquals(D.streamValue(id(1), Value.utf8("still here")), e.atClient.next());
-            e.atClient.next();
             e.awaitNoStreams();
+            // The other requests are none the worse.
+            send(e.client, request(MessageType.FUNCTION_REQUEST, 2, "echo"));
+            assertEquals(2, D.requestId(e.atServer.next()).longValue());
         }
     }
 
@@ -432,6 +466,10 @@ class QuicConnTest {
         final MultiThreadIoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
         Channel udp = null;
         QuicConn client = null;
+        // The wait is a quarter of a second; two seconds here, so that a
+        // machine that stalls for a moment does not blur what is being told apart.
+        final long wait = 2000;
+        QuicConn.peerEndWaitMillis = wait;
         try {
             udp = new Bootstrap().group(group).channel(NioDatagramChannel.class)
                     .handler(new io.netty.handler.codec.quic.QuicServerCodecBuilder()
@@ -477,7 +515,7 @@ class QuicConnTest {
                     Unpooled.wrappedBuffer(com.arpabet.valuerpc.Frames.encode(D.handshakeResponse(null))), true));
             assertEquals(D.handshakeResponse(null), atClient.next());
             long waited = TimeUnit.NANOSECONDS.toMillis(ended.get(0L).get(10, TimeUnit.SECONDS) - answered);
-            assertTrue(waited < 200, "the end of the client's half came after " + waited + " ms");
+            assertTrue(waited < wait / 2, "the end of the client's half came after " + waited + " ms");
             Ends.awaitStreams(client, 0);
 
             // The answer without the end of the server's half: the client
@@ -488,8 +526,8 @@ class QuicConnTest {
             opened.get(4L).writeAndFlush(Unpooled.wrappedBuffer(
                     com.arpabet.valuerpc.Frames.encode(D.functionResult(id(1), Value.utf8("hello")))));
             assertEquals(D.functionResult(id(1), Value.utf8("hello")), atClient.next());
-            waited = TimeUnit.NANOSECONDS.toMillis(ended.get(4L).get(10, TimeUnit.SECONDS) - answered);
-            assertTrue(waited >= 200 && waited < 5000, "the end of the client's half came after " + waited + " ms");
+            waited = TimeUnit.NANOSECONDS.toMillis(ended.get(4L).get(20, TimeUnit.SECONDS) - answered);
+            assertTrue(waited >= wait - 100 && waited < wait + 8000, "the end of the client's half came after " + waited + " ms");
             // What the client is given to send on it meanwhile, and after, is dropped.
             send(client, D.cancelRequest(id(1)));
             Ends.awaitStreams(client, 1);
@@ -507,10 +545,11 @@ class QuicConnTest {
             Thread.sleep(40);
             opened.get(8L).shutdownOutput();
             waited = TimeUnit.NANOSECONDS.toMillis(ended.get(8L).get(10, TimeUnit.SECONDS) - answered);
-            assertTrue(waited >= 30 && waited < 200, "the end of the client's half came after " + waited + " ms");
+            assertTrue(waited >= 30 && waited < wait / 2, "the end of the client's half came after " + waited + " ms");
             Ends.awaitStreams(client, 0);
             atClient.nothing(20);
         } finally {
+            QuicConn.peerEndWaitMillis = 250;
             if (client != null) {
                 client.close();
             }

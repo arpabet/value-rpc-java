@@ -342,13 +342,13 @@ class QuicClientTest {
 
     @Test
     void aConnectionThatIsSilentIsKeptWhileBothEndsSayTheyAreThere() throws Exception {
-        // Given up after 600 ms of silence, and made to speak every 150 ms.
-        final QuicOptions s = certs.server().withIdleTimeoutMillis(600).withKeepAliveMillis(150);
-        final QuicOptions c = certs.client().withIdleTimeoutMillis(600).withKeepAliveMillis(150);
+        // Given up after 2 s of silence, and made to speak every 250 ms.
+        final QuicOptions s = certs.server().withIdleTimeoutMillis(2000).withKeepAliveMillis(250);
+        final QuicOptions c = certs.client().withIdleTimeoutMillis(2000).withKeepAliveMillis(250);
         try (FakeServer server = serverWith(s);
                 VrpcClient client = clientOf(server, c).build()) {
             assertEquals(Value.ofLong(1), client.callFunction("echo", Value.ofLong(1)));
-            Thread.sleep(2000);
+            Thread.sleep(5000);
             assertTrue(client.isActive(), "still the same connection");
             assertEquals(Value.ofLong(2), client.callFunction("echo", Value.ofLong(2)));
             assertEquals(1, server.connections());

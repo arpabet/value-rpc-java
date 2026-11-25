@@ -440,6 +440,59 @@ class ClientTest {
         });
     }
 
+    /** The threads that are a client's or a connection's, by their names. */
+    private static java.util.Set<Thread> libraryThreads() {
+        final java.util.Set<Thread> out = new java.util.HashSet<Thread>();
+        for (Thread t : Thread.getAllStackTraces().keySet()) {
+            final String name = t.getName();
+            if (t.isAlive() && (name.startsWith("vrpc-client-") || name.startsWith("vrpc-send ")
+                    || name.startsWith("vrpc-read ") || name.startsWith("vrpc-accept "))) {
+                out.add(t);
+            }
+        }
+        return out;
+    }
+
+    @Test
+    void closingAClientAndItsServerLeavesNoThreadBehind() throws Exception {
+        final java.util.Set<Thread> before = libraryThreads();
+        overEachTransport(server -> {
+            final ClientInterceptor passes = (method, request, options, next) -> next.invoke(method, request, options);
+            final List<VrpcClient> clients = new ArrayList<VrpcClient>();
+            for (int i = 0; i < 8; i++) {
+                // With an interceptor, so that a call without waiting runs on a thread of the client.
+                final VrpcClient client = clientOf(server).interceptors(passes).build();
+                clients.add(client);
+                assertEquals(Value.ofLong(i), client.callFunction("echo", Value.ofLong(i)));
+                assertEquals(Value.ofLong(i), client.callFunctionAsync("echo", Value.ofLong(i), null).get(5, TimeUnit.SECONDS));
+            }
+            // One of them loses its connection and makes another.
+            server.drop();
+            waitFor(() -> server.connections() >= 9);
+            final java.util.Set<Thread> during = libraryThreads();
+            during.removeAll(before);
+            assertTrue(during.size() >= 16, "the clients have threads while they are open: " + during.size());
+            for (VrpcClient client : clients) {
+                client.close();
+            }
+        });
+        // The servers are closed too by now: nothing of the clients, of their
+        // connections or of the listeners is left.
+        final long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        java.util.Set<Thread> left = libraryThreads();
+        left.removeAll(before);
+        while (!left.isEmpty() && System.nanoTime() < until) {
+            Thread.sleep(10);
+            left = libraryThreads();
+            left.removeAll(before);
+        }
+        final List<String> names = new ArrayList<String>();
+        for (Thread t : left) {
+            names.add(t.getName());
+        }
+        assertTrue(left.isEmpty(), "threads that outlived their client or server: " + names);
+    }
+
     @Test
     void addressesAndTheirTransports() throws Exception {
         // In memory: a name is taken once, and a name nobody listens on cannot be dialed.

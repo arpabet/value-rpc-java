@@ -207,6 +207,48 @@ class GoQuicInteropTest {
     }
 
     @Test
+    void aChatWhoseClientHasSaidItsLastStillGetsAllThatComesBack() throws Exception {
+        // The client sends all it has and ends its side before it reads
+        // anything: more comes back after that than the server had credit
+        // for, so the client has to go on granting credit, with its side
+        // ended. By the rules of the Go transport it could not, and the chat
+        // stopped for good after 4096 values, the credit of one window.
+        final int n = 10_000;
+        try (VrpcClient client = clientOf(server.quic()).build();
+                Chat chat = client.chat("chat.echo", null, CallOptions.DEFAULT)) {
+            for (int i = 0; i < n; i++) {
+                chat.outgoing().send(Value.ofLong(i));
+            }
+            chat.outgoing().close();
+            int count = 0;
+            for (Value v = chat.incoming().take(20, TimeUnit.SECONDS); v != null; v = chat.incoming().take(20, TimeUnit.SECONDS)) {
+                assertEquals("echo:" + count, v.toString());
+                count++;
+            }
+            assertEquals(n, count);
+            assertEquals(0L, client.stats().get("pending").longValue());
+        }
+    }
+
+    @Test
+    void aChatTheServerEndsIsOverAndItsStreamIsFreed() throws Exception {
+        // On the listener that allows eight requests at once: twenty chats
+        // that the server ends before the client has said anything. Each is
+        // over then, and its stream has to be freed by both ends.
+        try (VrpcClient client = clientOf(server.quicSmall()).build()) {
+            for (int i = 0; i < 20; i++) {
+                try (Chat chat = client.chat("chat.sink", null, CallOptions.DEFAULT)) {
+                    assertNull(chat.incoming().take(), "chat " + i + ": the server has ended");
+                    assertSame(Code.CANCELED,
+                            assertThrows(VrpcException.class, () -> chat.outgoing().send(Value.ofLong(1))).code());
+                }
+            }
+            assertEquals(Value.utf8("Hello, end!"), client.callFunction("greet", Value.list(Value.utf8("end"))));
+            assertEquals(0L, client.stats().get("reconnects").longValue(), "on one connection all the way");
+        }
+    }
+
+    @Test
     void aChatUnderLoad() throws Exception {
         final int n = 10_000;
         try (VrpcClient client = clientOf(server.quic()).build();

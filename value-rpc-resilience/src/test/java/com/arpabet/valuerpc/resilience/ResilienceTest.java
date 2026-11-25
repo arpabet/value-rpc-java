@@ -83,7 +83,8 @@ class ResilienceTest {
         final long start = System.nanoTime();
         try {
             assertEquals(Code.UNAVAILABLE, failure(retry, calls).code(), "the last failure is what it came to");
-            assertTrue(System.nanoTime() - start < TimeUnit.MILLISECONDS.toNanos(500), "the retry stopped waiting");
+            // The wait it was in is a second: anything short of it is the interrupt.
+            assertTrue(System.nanoTime() - start < TimeUnit.MILLISECONDS.toNanos(900), "the retry stopped waiting");
             assertEquals(1, calls.count(), "interrupted during the first wait");
             assertTrue(Thread.currentThread().isInterrupted(), "the thread stays interrupted");
         } finally {

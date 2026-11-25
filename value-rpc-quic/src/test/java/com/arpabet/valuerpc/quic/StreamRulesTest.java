@@ -110,16 +110,26 @@ class StreamRulesTest {
         }
     }
 
+    private static final boolean[] EITHER = {true, false};
+
+    /** The one case in which this implementation does otherwise than the Go one where that one ends a half. */
+    private static boolean endOfAChatByWhoOpenedIt(boolean originatedHere, MessageType message, MessageType request) {
+        return originatedHere && request == CHAT_REQUEST && message == STREAM_END;
+    }
+
     @Test
-    void everyHalfTheGoImplementationEndsThisOneEndsToo() {
+    void whereTheGoImplementationEndsAHalfThisOneDoesTooButForWhoOpenedAChat() {
         for (MessageType message : MessageType.values()) {
-            for (boolean originatedHere : new boolean[] {true, false}) {
-                if (StreamRules.goFinOnWrite(originatedHere, message)) {
-                    assertTrue(StreamRules.finOnWrite(originatedHere, message));
-                }
+            for (boolean originatedHere : EITHER) {
                 for (MessageType request : REQUESTS) {
+                    if (StreamRules.goFinOnWrite(originatedHere, message)
+                            && !endOfAChatByWhoOpenedIt(originatedHere, message, request)) {
+                        assertTrue(StreamRules.finOnWrite(originatedHere, message, request),
+                                "sending " + message + " of " + request);
+                    }
                     if (StreamRules.goFinOnRead(message, request, originatedHere)) {
-                        assertTrue(StreamRules.finOnRead(message, request, originatedHere));
+                        assertTrue(StreamRules.finOnRead(message, request, originatedHere),
+                                "reading " + message + " of " + request);
                     }
                 }
             }
@@ -131,24 +141,63 @@ class StreamRulesTest {
         // More than the Go implementation: after either, the request is over
         // for both sides, whatever it was and whoever made it.
         for (MessageType over : new MessageType[] {ERROR_RESPONSE, CANCEL_REQUEST}) {
-            for (boolean originatedHere : new boolean[] {true, false}) {
-                assertTrue(StreamRules.finOnWrite(originatedHere, over));
+            for (boolean originatedHere : EITHER) {
                 for (MessageType request : REQUESTS) {
+                    assertTrue(StreamRules.finOnWrite(originatedHere, over, request));
                     assertTrue(StreamRules.finOnRead(over, request, originatedHere));
                 }
+                assertTrue(StreamRules.finOnWrite(originatedHere, over, null));
                 assertTrue(StreamRules.finOnRead(over, null, originatedHere));
             }
         }
-        // And nothing else is added.
+    }
+
+    @Test
+    void whoOpenedAChatKeepsItsHalfUntilThePeerEndsTheChat() {
+        // Otherwise than the Go implementation, which ends the half with the
+        // end of what that side streams. A chat goes on after that: the peer
+        // still streams, and has to be granted credit for it.
+        assertTrue(StreamRules.goFinOnWrite(true, STREAM_END), "the Go implementation ends the half");
+        assertFalse(StreamRules.finOnWrite(true, STREAM_END, CHAT_REQUEST), "the half stays, for the credit of the peer");
+        // The peer ending what it streams ends the chat: nothing is sent after it.
+        assertFalse(StreamRules.goFinOnRead(STREAM_END, CHAT_REQUEST, true), "the Go implementation leaves the half open");
+        assertTrue(StreamRules.finOnRead(STREAM_END, CHAT_REQUEST, true));
+        // What travels in between ends nothing.
+        for (MessageType between : new MessageType[] {STREAM_READY, STREAM_VALUE, STREAM_CREDIT}) {
+            assertFalse(StreamRules.finOnWrite(true, between, CHAT_REQUEST));
+            assertFalse(StreamRules.finOnRead(between, CHAT_REQUEST, true));
+        }
+    }
+
+    @Test
+    void whoAnswersAChatEndsItWithTheEndOfWhatItStreamsAsInGo() {
+        // The end of what the one who opened it streams does not end the chat.
+        assertFalse(StreamRules.finOnRead(STREAM_END, CHAT_REQUEST, false));
+        // Its own does, and its half with it.
+        assertTrue(StreamRules.finOnWrite(false, STREAM_END, CHAT_REQUEST));
+        for (MessageType between : new MessageType[] {STREAM_READY, STREAM_VALUE, STREAM_CREDIT}) {
+            assertFalse(StreamRules.finOnWrite(false, between, CHAT_REQUEST));
+            assertFalse(StreamRules.finOnRead(between, CHAT_REQUEST, false));
+        }
+    }
+
+    @Test
+    void nothingElseIsOtherThanInTheGoImplementation() {
         for (MessageType message : MessageType.values()) {
             if (message == ERROR_RESPONSE || message == CANCEL_REQUEST) {
                 continue;
             }
-            for (boolean originatedHere : new boolean[] {true, false}) {
-                assertEquals(StreamRules.goFinOnWrite(originatedHere, message), StreamRules.finOnWrite(originatedHere, message));
+            for (boolean originatedHere : EITHER) {
                 for (MessageType request : REQUESTS) {
+                    if (endOfAChatByWhoOpenedIt(originatedHere, message, request)) {
+                        continue;
+                    }
+                    assertEquals(StreamRules.goFinOnWrite(originatedHere, message),
+                            StreamRules.finOnWrite(originatedHere, message, request),
+                            "sending " + message + " of " + request);
                     assertEquals(StreamRules.goFinOnRead(message, request, originatedHere),
-                            StreamRules.finOnRead(message, request, originatedHere));
+                            StreamRules.finOnRead(message, request, originatedHere),
+                            "reading " + message + " of " + request);
                 }
             }
         }

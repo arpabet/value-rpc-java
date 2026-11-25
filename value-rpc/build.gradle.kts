@@ -1,6 +1,7 @@
 plugins {
     id("vrpc.library")
     id("vrpc.android-api")
+    id("vrpc.publish")
     // FakeServer and GoServer, the peers the tests of every module talk to.
     `java-test-fixtures`
 }
@@ -24,3 +25,9 @@ tasks.jar {
         attributes("Automatic-Module-Name" to "com.arpabet.valuerpc")
     }
 }
+
+// The servers of the tests are for the tests of this repository: what is
+// published is the library.
+val javaComponent = components["java"] as AdhocComponentWithVariants
+javaComponent.withVariantsFromConfiguration(configurations["testFixturesApiElements"]) { skip() }
+javaComponent.withVariantsFromConfiguration(configurations["testFixturesRuntimeElements"]) { skip() }

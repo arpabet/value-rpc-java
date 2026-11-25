@@ -1,6 +1,7 @@
 plugins {
     id("vrpc.library")
     id("vrpc.android-api")
+    id("vrpc.publish")
 }
 
 description = "Resilience policies for vRPC clients: the Java implementation of go.arpabet.com/value-rpc/resilience"

@@ -97,26 +97,52 @@ final class StreamRules {
     }
 
     /**
-     * Whether to end this side's half of the stream after sending a message:
-     * when the Go implementation would, and also after any message that ends
-     * the request.
+     * Whether to end this side's half of the stream after sending a message.
+     * It is what the Go implementation does, but for two things.
      *
-     * <p>The second part is more than the Go implementation does. It leaves
-     * a half open in a few cases where nothing more will be sent: the stream
-     * then lasts as long as the connection, on both ends. Ending a half
-     * early is safe towards it: it reads the end of the stream as the peer
-     * being done, which is the truth.
+     * <p>A half is also ended after any message that ends the request for
+     * both sides. The Go implementation leaves it open in a few of those
+     * cases, where nothing more will be sent: the stream then lasts as long
+     * as the connection, on both ends. Ending a half early is safe towards
+     * it: it reads the end of the stream as the peer being done, which is the
+     * truth.
+     *
+     * <p>And the side that opened a chat does not end its half with the end
+     * of what it streams, as the Go implementation does. A chat goes on after
+     * that: the peer still streams, until it ends the chat, and has to be
+     * granted credit for what it sends. With its half ended this side could
+     * grant none, and the peer would stop after the values it had credit for,
+     * for good. The half is ended when the peer ends the chat (see
+     * {@link #finOnRead}).
+     *
+     * @param originatedHere whether this side made the request
+     * @param sent           the message it sends
+     * @param request        the message that opened the request
      */
-    static boolean finOnWrite(boolean originatedHere, MessageType sent) {
-        return goFinOnWrite(originatedHere, sent) || endsTheRequest(sent);
+    static boolean finOnWrite(boolean originatedHere, MessageType sent, MessageType request) {
+        if (endsTheRequest(sent)) {
+            return true;
+        }
+        if (originatedHere && request == MessageType.CHAT_REQUEST && sent == MessageType.STREAM_END) {
+            return false;
+        }
+        return goFinOnWrite(originatedHere, sent);
     }
 
     /**
      * Whether to end this side's half of the stream after reading a message:
-     * when the Go implementation would, and also after any message that ends
-     * the request. See {@link #finOnWrite}.
+     * when the Go implementation would, after any message that ends the
+     * request, and, for the side that opened a chat, when the peer ends what
+     * it streams, which ends the chat: whether or not this side had sent its
+     * last, it sends nothing after that. See {@link #finOnWrite}.
      */
     static boolean finOnRead(MessageType received, MessageType request, boolean originatedHere) {
-        return goFinOnRead(received, request, originatedHere) || endsTheRequest(received);
+        if (endsTheRequest(received)) {
+            return true;
+        }
+        if (originatedHere && request == MessageType.CHAT_REQUEST && received == MessageType.STREAM_END) {
+            return true;
+        }
+        return goFinOnRead(received, request, originatedHere);
     }
 }

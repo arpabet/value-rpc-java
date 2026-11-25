@@ -1,0 +1,14 @@
+-1	Unknown	dnJwYyBVbmtub3duOiBib29t
+0	OK	dnJwYyBPSzogYm9vbQ==
+1	Unknown	dnJwYyBVbmtub3duOiBib29t
+2	Canceled	dnJwYyBDYW5jZWxlZDogYm9vbQ==
+3	InvalidArgument	dnJwYyBJbnZhbGlkQXJndW1lbnQ6IGJvb20=
+4	DeadlineExceeded	dnJwYyBEZWFkbGluZUV4Y2VlZGVkOiBib29t
+5	NotFound	dnJwYyBOb3RGb3VuZDogYm9vbQ==
+6	ResourceExhausted	dnJwYyBSZXNvdXJjZUV4aGF1c3RlZDogYm9vbQ==
+7	Unavailable	dnJwYyBVbmF2YWlsYWJsZTogYm9vbQ==
+8	Unauthenticated	dnJwYyBVbmF1dGhlbnRpY2F0ZWQ6IGJvb20=
+9	Internal	dnJwYyBJbnRlcm5hbDogYm9vbQ==
+10	Unknown	dnJwYyBVbmtub3duOiBib29t
+11	Unknown	dnJwYyBVbmtub3duOiBib29t
+12	Unknown	dnJwYyBVbmtub3duOiBib29t

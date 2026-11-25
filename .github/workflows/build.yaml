@@ -1,0 +1,102 @@
+name: Value RPC Java CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request replaces the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # go.arpabet.com modules are fetched from their source, not from Google's
+  # module proxy.
+  GOPRIVATE: go.arpabet.com/*
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      # Each JDK reports for itself: one failing does not hide the other.
+      fail-fast: false
+      matrix:
+        java-version: [ '17', '21' ]
+    steps:
+      - uses: actions/checkout@v7
+
+      # The wrapper jar is the one binary in the repository: check it is Gradle's.
+      - name: Validate the Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+          cache: gradle
+
+      # The tests against the Go implementation build and start its server
+      # (conformance/server); without Go they would be skipped.
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: conformance/go.mod
+          cache-dependency-path: conformance/go.sum
+
+      # Compiles, checks the Android API level, and runs the tests: against the
+      # committed fixtures and against the Go server.
+      - name: Build
+        run: ./gradlew build
+
+      - name: Keep the test report of a failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-report-jdk${{ matrix.java-version }}
+          path: value-rpc/build/reports/tests/test
+          retention-days: 7
+
+  # The fixtures in the repository are what the Go implementation writes, and
+  # the Java implementation agrees with it on many more.
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: conformance/go.mod
+          cache-dependency-path: conformance/go.sum
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: The committed fixtures are up to date
+        working-directory: conformance
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go run ./golden
+          if [ -n "$(git status --porcelain -- ../value-rpc/src/test/resources/golden)" ]; then
+            git status --short -- ../value-rpc/src/test/resources/golden
+            echo "::error::the fixtures are not what the generator writes: run 'cd conformance && go run ./golden' and commit the result"
+            exit 1
+          fi
+
+      - name: Write many more with the Go implementation
+        working-directory: conformance
+        run: go run ./golden -out "$RUNNER_TEMP/golden" -scale 30
+
+      - name: Check the Java implementation against them
+        run: ./gradlew test -PgoldenDir="$RUNNER_TEMP/golden"

@@ -1,0 +1,12 @@
+.gradle/
+build/
+out/
+.idea/
+*.iml
+.DS_Store
+*.class
+local.properties
+
+# conformance tools: local-dev workspace and compiled binaries
+conformance/go.work
+conformance/go.work.sum

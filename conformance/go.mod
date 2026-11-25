@@ -4,8 +4,8 @@ go 1.25.0
 
 require (
 	go.arpabet.com/value v1.7.0
-	go.arpabet.com/value-rpc v1.7.1
-	go.arpabet.com/value-rpc/quic v1.7.1
+	go.arpabet.com/value-rpc v1.7.2
+	go.arpabet.com/value-rpc/quic v1.7.2
 	go.uber.org/zap v1.28.0
 )
 

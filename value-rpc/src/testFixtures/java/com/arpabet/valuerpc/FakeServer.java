@@ -54,7 +54,12 @@ public final class FakeServer implements AutoCloseable {
 
     /** @param address where to listen: {@code mem://name} or {@code tcp://127.0.0.1:0} */
     public FakeServer(String address) throws IOException {
-        this.listener = Transports.listener(address, TransportOptions.DEFAULT);
+        this(Transports.listener(address, TransportOptions.DEFAULT));
+    }
+
+    /** A server on a listener of the test's own making: another transport. */
+    public FakeServer(Listener listener) {
+        this.listener = listener;
         function("greet", args -> Value.utf8("Hello, " + ((com.arpabet.value.ListValue) args).get(0) + "!"));
         function("echo", args -> args);
         function("fail", args -> {
@@ -63,10 +68,15 @@ public final class FakeServer implements AutoCloseable {
         listener.start(this::accept);
     }
 
-    /** The address a client dials. */
+    /** The address a client dials: of the transports that come with the core, with their scheme. */
     public String address() {
         final String a = listener.address();
         return a.startsWith("mem://") ? a : "tcp://" + a;
+    }
+
+    /** The address it listens on, as its listener gives it. */
+    public String listenerAddress() {
+        return listener.address();
     }
 
     /** A function it serves. What it throws with a code is the error the caller gets. */

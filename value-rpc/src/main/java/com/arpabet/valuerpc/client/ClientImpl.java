@@ -35,6 +35,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -463,8 +464,34 @@ final class ClientImpl implements VrpcClient {
     public CompletableFuture<Value> callFunctionAsync(String name, Value args, CallOptions options) {
         final CallOptions o = options == null ? CallOptions.DEFAULT : options;
         if (intercepted) {
-            // Interceptors are written to wait for the call: they run on a thread of the client.
-            return CompletableFuture.supplyAsync(() -> invoker.invoke(name, args, o), executor());
+            // Interceptors are written to wait for the call: they run on a
+            // thread of the client. Cancelling the future interrupts it, which
+            // cancels the call that is under way, and has an interceptor that
+            // waits, between the attempts of a retry say, stop waiting.
+            final CompletableFuture<Value> future = new CompletableFuture<Value>();
+            if (closed) {
+                future.completeExceptionally(clientClosed());
+                return future;
+            }
+            final Future<?> chain;
+            try {
+                chain = executor().submit(() -> {
+                    try {
+                        future.complete(invoker.invoke(name, args, o));
+                    } catch (Throwable t) {
+                        future.completeExceptionally(t);
+                    }
+                });
+            } catch (RejectedExecutionException e) {
+                future.completeExceptionally(clientClosed());
+                return future;
+            }
+            future.whenComplete((value, error) -> {
+                if (future.isCancelled()) {
+                    chain.cancel(true);
+                }
+            });
+            return future;
         }
         final PendingCall p = new PendingCall(lastRequest.incrementAndGet(), name);
         try {

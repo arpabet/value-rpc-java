@@ -23,7 +23,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * and a transport of one's own is a {@link Dialer} or a {@link Listener}, for
  * which {@link #dialer(StreamSource, TransportOptions)} and
- * {@link StreamConn} frame any stream of bytes.
+ * {@link StreamConn} frame any stream of bytes. QUIC is such a transport: it
+ * comes with the module {@code value-rpc-quic}, which keeps its dependencies
+ * out of this one, and {@code quic://} here says so.
  */
 public final class Transports {
 
@@ -51,7 +53,7 @@ public final class Transports {
             case "mem":
                 return Mem.dialer(a[1]);
             case "quic":
-                return failing("quic:// is not part of this library");
+                return failing("quic:// is provided by the separate module com.arpabet:value-rpc-quic (QuicTransport.dialer)");
             default:
                 return failing("unsupported dial network " + a[0] + " in address " + address);
         }
@@ -68,7 +70,8 @@ public final class Transports {
             case "mem":
                 return Mem.listen(a[1]);
             case "quic":
-                throw new IOException("quic:// is not part of this library");
+                throw new IOException(
+                        "quic:// is provided by the separate module com.arpabet:value-rpc-quic (QuicTransport.listener)");
             default:
                 throw new IOException("unsupported listen network " + a[0] + " in address " + address);
         }

@@ -4,13 +4,18 @@ Port of `go.arpabet.com/value-rpc` (Go) to Java on top of `com.arpabet:value`
 (value-java), wire-compatible with the Go implementation and with
 `@arpabet/vrpc` (value-rpc-js).
 
-Status: research complete, decisions taken (§10), nothing implemented yet.
-Written 2026-11-24; revised the same day after the decisions and after the
-upstream fixes of §6 were released.
+Status: the protocol core, the client and its transports over TCP and in
+memory, the resilience policies and the QUIC transport are written and pass
+against the Go implementation; the rest is as planned below. Written
+2026-11-24; revised the same day after the decisions and after the upstream
+fixes of §6 were released, and on 2026-11-25 when resilience and QUIC were
+added ahead of their place in the plan, on request.
 
 ## Progress
 
-Nothing is committed: the work is in the working tree for review.
+The first implementation is committed (`3454d36`). What came after it, the
+two modules of 2026-11-25 and what they needed elsewhere, is in the working
+tree for review.
 
 | Phase | State | What is there |
 |---|---|---|
@@ -21,16 +26,79 @@ Nothing is committed: the work is in the working tree for review.
 | 3c Client: reconnect | in part | a lost connection fails what waited, at once, and is made again as the same session with the next link of the hash chain (checked against the Go server). Not yet: retry with backoff, replay of idempotent calls |
 | 3b Client: streams | done | `getStream` / `putStream` / `chat` as `ValueStream`, `ValueSink`, `Chat`; credit granted as the application takes values, sending gated by the server's credit; early close cancels; a refused stream fails to open; a lost connection fails its streams. 12 scenarios against the Go server, among them 100,000 values from it, 50,000 to it, 20,000 both ways in a chat, and a window of 3. No test of its own without Go yet: that comes with the Java server |
 | 4 Client as a peer | next | serving the calls and streams the server opens on the client; today such a request is answered `NotFound` |
+| 10 Resilience (ahead of its place) | done | module `value-rpc-resilience`, package `com.arpabet.valuerpc.resilience`: `Resilience.retry()`, `circuitBreaker()`, `timeoutMillis`, `fallback`, `bulkhead`, `rateLimit`, with the defaults and the failures of the Go module. No dependency of its own; passes the API 26 check. 65 tests: the 14 of the Go module one for one, what a client adds, and 7 against the Go server |
+| QUIC (was left out; added on request) | done, as a transport | module `value-rpc-quic`, package `com.arpabet.valuerpc.quic`, on Netty's QUIC codec 4.2.21: `QuicTransport.client`, `dialer` and `listener`, `QuicOptions`. One QUIC stream for each request, as `quic/transport.go`; ALPN `vrpc`; mutual TLS. 66 tests: the Java client against the Go QUIC server (the tests of `quic/transport_test.go`), the Go client (`conformance/client`) against the Java listener, both ends in Java. JVM only: the codec is native code. The listener waits for the server engine of phase 7 to be of use beyond the tests |
 | 5 and later | see below | |
 
-How to run: `./gradlew build` (80 tests). The ones against the Go server build `conformance/server` and are
-skipped without a Go toolchain. `cd conformance && go run ./golden` writes the fixtures again.
+How to run: `./gradlew build` (212 tests in three modules). The ones against the Go implementation build
+`conformance/server` and `conformance/client` and are skipped without a Go toolchain.
+`cd conformance && go run ./golden` writes the fixtures again.
 
-Differences from the Go implementation found so far, all on input no peer sends:
+What the two modules needed elsewhere:
+
+- The core: a call made with `callFunctionAsync` behind interceptors could not be cancelled; cancelling its
+  future now interrupts the thread that runs the interceptors, which cancels the call under way and stops a
+  policy that waits. `quic://` in an address of the core names the module, as in Go.
+- The build: what the modules have in common is in `buildSrc` (`vrpc.library`, `vrpc.android-api`); the
+  servers of the tests (`FakeServer`, `GoServer`) are test fixtures of `value-rpc`, for every module.
+- `conformance/`: the Go server also listens on QUIC (a listener as it comes, one that allows eight requests
+  at once, one with mutual TLS; a certificate authority made when it starts) and has a `flaky` function;
+  `conformance/client` is the Go client over QUIC as a program.
+
+Differences from the Go implementation found so far. On input no peer sends:
 
 - A JSON string with the extension prefix and a type the format defines (1, 2, -1): Go keeps it an opaque
   extension whatever its payload; here it is the kind the type names, or text when the payload is not one of
   that kind. With a canonical payload the bytes are the same.
+
+In the QUIC transport, none of which a peer has to know of:
+
+- **When a half of a stream is ended.** Every half Go ends, this ends too. It also ends its half after any
+  message that ends the request for both sides, a failure or a cancellation, whoever sent it and whatever the
+  request: by Go's rules the half stays open in some of those cases (a chat, or a stream to the peer, that
+  the peer fails; a request the peer cancels), and the stream then lasts as long as the connection. This
+  is read from `finOnWrite` and `finOnRead`, not measured. `StreamRules` has both sets of rules, and
+  `StreamRulesTest` says which is which.
+- **A message for a request that is over** (a credit that was on its way): Go opens a new stream for it when
+  the id is one it owns, and fails the write otherwise; here it is dropped, and a stream is opened only by the
+  message that opens a request.
+- **A frame that is too long, or is not a message**, ends the connection, as on TCP. Go stops reading that one
+  stream and keeps the connection, on which the caller then waits out its timeout.
+- **Keeping a silent connection.** Go sends a PING every 15 s. Netty has no way to send one, so this sends a
+  QUIC datagram, to a peer that takes datagrams, which is another one of this implementation. A Go peer does
+  not take them and keeps the connection with its own PINGs (checked: 14 s of silence against an idle timeout
+  of 6 s). quic-go takes an idle timeout of less than 5 s as 5 s, and its PINGs would come too late for a
+  shorter one here.
+- **A request that is one too many** for the streams the peer allows waits for one, as in Go, but no longer
+  than the write timeout of the transport; then the connection is given up and made again. Go waits for good.
+
+Two things found on the way that are not differences but should be known:
+
+- **In the Go QUIC transport a connection the peer closed is not noticed by the reader.**
+  `quicMsgConn.ReadMessage` waits on its queue, on its own `done` and on the read deadline, and not on the
+  QUIC connection. A Go client without a certificate against the Go server that wants one takes the whole
+  dial timeout, 30 s, and fails with `handshake: i/o timeout`, where this client is refused in a tenth of a
+  second; reproduced with Go on both ends (`conformance/client` against the `quic-mtls` listener of
+  `conformance/server`). After the handshake the response loop reads without a deadline, so a client that
+  only waits would not learn that its connection is gone until it writes. **Fixed on 2026-11-25 in the
+  working tree of value-rpc** (`quic/transport.go`, tests in `quic/closed_conn_test.go`, an entry in its
+  changelog), on request; not committed and not released. `ReadMessage` now ends when the connection has
+  ended and the stream readers have handed over what they had read. The refused client fails in
+  milliseconds with the reason, and an idle client reconnects; the Java QUIC tests pass against the fixed
+  transport as well (run once with a `go.work` in `conformance/` that points at the checkout). The
+  conformance module here pins v1.7.0, which does not have the fix, so the Go client of the tests is still
+  given little time to connect where it is to be refused (`-connect-timeout`).
+- **Netty's QUIC codec (quiche underneath) can lose the end of a half of a stream that is sent by itself.**
+  What was seen, in the packet logs of both ends: of 41 ends that were written to the codec, and accepted by
+  it, 3 were sent; the 38 others were written while the codec was working through packets that had arrived
+  together, and the peer's own end was read before the codec sent anything. What is taken from that, and
+  from what made it go away: the library forgets a stream once the peer's end was read and every byte this
+  side sent was acknowledged, and an end with no bytes of its own does not hold it back. `QuicConn` therefore
+  sends the end with the last message wherever there is one, and otherwise writes it only when the peer's
+  own end was read, and between two rounds of reading; with that, 41 of 41 arrive, run after run. What may
+  be left is narrow, and was not seen: a peer that ends its half more than a quarter of a second after its
+  last message, together with the loss of the packet that carried this side's end, would leave that one
+  stream open at the peer until the connection ends. Worth reporting to Netty.
 
 ## 1. Summary
 
@@ -41,7 +109,8 @@ Differences from the Go implementation found so far, all on input no peer sends:
   `Limits`.
 - **Scope is about 8,700 lines of Go** (non-test) in three packages plus the
   `resilience` module, and 213 test functions. QUIC (560 lines, its own Go
-  module) is left out, as you suggested.
+  module) was to be left out; it was asked for on 2026-11-25 and is a module
+  of its own here too, on Netty.
 - **There is no normative protocol spec.** `WEB.md` §5 calls for a
   `PROTOCOL.md` and golden frames; neither exists. This plan extracts the
   contract from the code (Appendix A) and makes golden fixtures plus live
@@ -94,7 +163,7 @@ The port is done when all four hold:
 
 | In | Deferred (seam kept, not built now) | Out |
 |---|---|---|
-| Wire protocol, all 4 patterns, both call directions (peer symmetry) | QUIC transport (Netty has a codec for it, should it be wanted) | Obfuscation transports (`obfs`) |
+| Wire protocol, all 4 patterns, both call directions (peer symmetry) | QUIC on Android: Netty's codec is native and has no Android build; a pure-Java QUIC would be another module | Obfuscation transports (`obfs`) |
 | Credit-based flow control, cancellation, timeouts/SLA | Mounting the server in Jakarta WebSocket / Spring | Code generation of any kind |
 | Handshake, authenticator, connect-authorizer, principal | permessage-deflate on WebSocket | `java.net.http`: no Android version has it |
 | Hash-chain session resumption, reconnect policy, unary replay | | |
@@ -104,6 +173,7 @@ The port is done when all four hold:
 | Wire codecs: MessagePack everywhere, JSON on WebSocket (optional to use, compatible when used) | | |
 | TypeDef/Verify, typed `Codec<T>` helpers, interceptors, metrics, metadata, dialect | | |
 | `resilience` (retry, breaker, timeout, fallback, bulkhead, rate limit) | | |
+| QUIC transport on a JVM, one stream for each request, in a module of its own on Netty | | |
 | Examples, README, `PROTOCOL.md`, CI, Maven Central release | | |
 
 ## 5. Design decisions (Go → Java)
@@ -149,7 +219,11 @@ value-rpc-java/
     com.arpabet.valuerpc.transport   TCP, TLS, WebSocket client, in-memory, bring-your-own
   value-rpc-netty/           → com.arpabet:value-rpc-netty    (depends on Netty; JVM servers)
     com.arpabet.valuerpc.netty       WebSocket server; TCP, TLS and Unix listeners on event loops
-  value-rpc-resilience/      → com.arpabet:value-rpc-resilience  (Go: resilience module)
+  value-rpc-resilience/      → com.arpabet:value-rpc-resilience  (Go: resilience module; loads on Android 8)
+    com.arpabet.valuerpc.resilience  the policies, as interceptors of a client
+  value-rpc-quic/            → com.arpabet:value-rpc-quic     (Go: quic module; depends on Netty's QUIC codec; JVM only)
+    com.arpabet.valuerpc.quic        the dialer and the listener
+  buildSrc/                  what the builds of the modules have in common
   examples/                  not published; an Android client among them
   conformance/               Go module: golden/ (fixture writer), server/, client/ (scenario driver)
   PROTOCOL.md  README.md  CHANGELOG.md
@@ -256,7 +330,7 @@ Go the handler has returned by then; from there the stream counts against
 | `unix://` | `SocketChannel` / `ServerSocketChannel` with `StandardProtocolFamily.UNIX` (JDK 16+), in a class loaded only on a JVM; or Netty's native transport | core (JVM only), `value-rpc-netty` | stale-socket cleanup that refuses a non-socket file; peer credentials via `ExtendedSocketOptions.SO_PEERCRED` (uid/gid, no pid; platform support to verify on Linux and macOS) |
 | `mem://` | in-JVM registry, rendezvous hand-off of the `MapValue` by reference | core | a mutable map is taken as `toImmutable()` at the boundary |
 | `NewFuncDialer`, `NewSingleConnDialer`, `NewAcceptListener`, `NewSingleConnListener` | the same four, over an `InputStream`/`OutputStream` pair | core | the seam for custom transports |
-| `quic://` | not ported; the address gives the same "provided by a separate module" error as Go core | | Netty's QUIC codec is where it would go |
+| `quic://` (`valuequic.NewDialer`, `NewListener`) | Netty's QUIC codec (quiche and BoringSSL, native), with the stream of each request as a channel | `value-rpc-quic` | `QuicTransport.dialer` / `listener`; in the core the address gives the same "provided by a separate module" error as in Go core. TLS 1.3 with ALPN `vrpc`, mutual TLS, the handshake handed over before any other stream, streams freed when both halves ended. Not on Android |
 
 Whether an Android app needs WebSocket at all depends on what the servers
 expose: `tls://` is the protocol's own transport and needs nothing but a TLS
@@ -370,7 +444,8 @@ side follows.
 | 7 | Server engine | accept loop with backoff, connection cap, connect-authorizer, handshake, authenticator and principal, session registry, resume/replace, session reaping, sender with coalescing and close-flush, dispatch, request context, the four patterns, request/stream limits, handler-failure isolation, graceful close; over TCP, TLS and `mem://` on sockets | **Go client ↔ Java server**, all scenarios; Java ↔ Java matrix; ports of `integration_test` (39), `session_test`, `session_reap_test`, `server_close_flush_test`, `sender_flush_test`, `client_close_test` | L |
 | 8 | Server as a peer | the server-side `Peer` handle: reverse calls and streams toward a client, fail-fast on reconnect, establish timeout | reverse scenarios in every pairing; ports of the `reverse_*` and hardening tests. Mostly wiring, the engine being symmetric since phase 3 | S–M |
 | 9 | `value-rpc-netty` | WebSocket server (both codecs, origins, ping, limits, `wss`), mountable in a pipeline of your own; TCP, TLS and Unix listeners on event loops | transport matrix over every transport; Go and JS WebSocket clients against the Java server in both codecs (**the value-rpc-js conformance suite, 19 scenarios × 2 codecs, pointed at Java**) | L |
-| 10 | Resilience, examples, docs | `value-rpc-resilience`; the 12 examples of the Go repo; `PROTOCOL.md` | examples run against both servers; ports of `resilience` tests | M |
+| 10 | Resilience, examples, docs | `value-rpc-resilience` (**done 2026-11-25**); the 12 examples of the Go repo; `PROTOCOL.md` | examples run against both servers; ports of `resilience` tests (done) | M |
+| — | QUIC (added 2026-11-25) | `value-rpc-quic`: client builder, dialer and listener on Netty's QUIC codec (**done**); `valuequic.NewServer` as one call comes with the server engine | the Java client against the Go QUIC server and the Go client against the Java listener (done); the reverse tests of `quic/reverse_test.go` with phases 4 and 8 | M |
 | 11 | Hardening and release | fuzz/property tests of frame and JSON decoding; stress (10,000 concurrent unary, many streams, churn of reconnects); thread and memory leak checks after close; JMH numbers next to Go's; a CI run on virtual threads; publish the server and Netty artifacts | all of §3 holds | M |
 
 Phases 3, 4 and 7 are where the risk is. If the engine is built symmetric from
@@ -442,7 +517,7 @@ Still on their defaults, to be confirmed or changed before phase 1:
 | D3 | Coordinates and names: `com.arpabet:value-rpc`, package `com.arpabet.valuerpc`, classes `VrpcClient` / `VrpcServer` / `VrpcException` (JS uses the `Vrpc` prefix) | as written |
 | D4 | API style: blocking-first with `CompletableFuture` variants, streams as iterator and sink | as written; no reactive types in core |
 | D8 | Where `PROTOCOL.md` and the wire fixtures live in the end | start here; move to `value-rpc` and copy out, as `canonical.json` is |
-| D9 | Skip QUIC; port `resilience`; keep the customizable dialect | yes to all three |
+| D9 | Skip QUIC; port `resilience`; keep the customizable dialect | resilience and the dialect: yes. QUIC: asked for on 2026-11-25 and added, on Netty (which D5 had welcomed for the server), as a module of its own that is not for Android |
 | D10 | Does an Android app need `wss://`, or do the servers expose `tls://`? | build both; it only orders phases 5 and 6 |
 
 ---
@@ -662,8 +737,8 @@ was not JSON).
 | `valueclient/serving.go`, `valueserver/serving_request.go` | engine `Responder` |
 | `valueserver/api.go`, `options.go`, `debug.go`, `function.go` | `VrpcServer` and its builder, `ConnectAuthorizer`, `Authenticator`, `HandlerRegistry` |
 | `valueserver/server.go`, `serving_client.go` | `ServerImpl`, `Session` |
-| `resilience/*.go` | `com.arpabet.valuerpc.resilience`: `Retry`, `CircuitBreaker`, `Timeout`, `Fallback`, `Bulkhead`, `RateLimit` |
-| `quic/*.go` | not ported |
+| `resilience/*.go` | `com.arpabet.valuerpc.resilience`: `Resilience` (the six policies, as the functions of the Go package), `Retry` and `CircuitBreaker` (what `With…` options are in Go are `with…` methods here), `Fallback` |
+| `quic/transport.go` | `com.arpabet.valuerpc.quic`: `QuicTransport` (`NewClient`, `NewDialer`, `NewListener`; `NewServer` comes with the server engine), `QuicOptions` (`DialTimeout`, `KeepAlivePeriod`, `MaxStreams`, the `tls.Config`), `QuicConn` (`quicMsgConn`), `StreamRules` (`finOnWrite`, `finOnRead`, who opens a stream) |
 
 ## Appendix C — Go tests → phase
 
@@ -675,8 +750,8 @@ was not JSON).
 | `valueserver`: integration, matrix, session, session_reap, close_flush, sender_flush, client_close, dialect, example | 59 | 7 |
 | `valueserver`: reverse_call, reverse_stream, reverse_metadata, reverse_putwait, reverse_reconnect, hardening_reverse | 13 | 4, 8 |
 | `valueserver`: transport, transport_conn, transport_mem, transport_tls, transport_ws, transport_ws_json | 24 | 2, 7, 9 |
-| `resilience` | 14 | 10 |
-| `quic` | 14 | not ported |
+| `resilience` | 14 | 10: done |
+| `quic` | 14 | done but for the 4 of `reverse_test.go`, which need phases 4 and 8 |
 
 ## Appendix D — defaults to keep
 

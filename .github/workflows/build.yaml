@@ -41,25 +41,27 @@ jobs:
           java-version: ${{ matrix.java-version }}
           cache: gradle
 
-      # The tests against the Go implementation build and start its server
-      # (conformance/server); without Go they would be skipped.
+      # The tests against the Go implementation build and start its server and
+      # its client (conformance/server, conformance/client); without Go they
+      # would be skipped.
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version-file: conformance/go.mod
           cache-dependency-path: conformance/go.sum
 
-      # Compiles, checks the Android API level, and runs the tests: against the
-      # committed fixtures and against the Go server.
+      # Compiles every module, checks the Android API level of the ones that
+      # load on Android, and runs the tests: against the committed fixtures,
+      # and against the Go server and the Go client, over TCP and over QUIC.
       - name: Build
         run: ./gradlew build
 
-      - name: Keep the test report of a failure
+      - name: Keep the test reports of a failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: test-report-jdk${{ matrix.java-version }}
-          path: value-rpc/build/reports/tests/test
+          path: '*/build/reports/tests/test'
           retention-days: 7
 
   # The fixtures in the repository are what the Go implementation writes, and

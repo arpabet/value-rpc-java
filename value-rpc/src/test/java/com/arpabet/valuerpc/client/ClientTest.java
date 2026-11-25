@@ -348,6 +348,55 @@ class ClientTest {
     }
 
     @Test
+    void cancellingACallBehindInterceptorsCancelsItAndStopsTheirWaiting() throws Exception {
+        overEachTransport(server -> {
+            server.mute = true;
+            // An interceptor that waits, as a retry does between its attempts,
+            // once the call it wraps has failed.
+            final java.util.concurrent.CountDownLatch unwound = new java.util.concurrent.CountDownLatch(1);
+            final List<String> seen = Collections.synchronizedList(new ArrayList<String>());
+            final ClientInterceptor waits = (method, request, options, next) -> {
+                try {
+                    return next.invoke(method, request, options);
+                } catch (VrpcException e) {
+                    seen.add(e.code().toString());
+                    try {
+                        Thread.sleep(60_000);
+                    } catch (InterruptedException interrupted) {
+                        seen.add("interrupted while waiting");
+                    }
+                    throw e;
+                } finally {
+                    unwound.countDown();
+                }
+            };
+            try (VrpcClient client = clientOf(server).interceptors(waits).build()) {
+                final CompletableFuture<Value> f = client.callFunctionAsync("greet", null, null);
+                assertSame(MessageType.FUNCTION_REQUEST, D.messageType(server.next(2000)));
+                assertTrue(f.cancel(true));
+                assertEquals(D.cancelRequest(Value.ofLong(1)), server.next(2000), "the server is told");
+                assertTrue(unwound.await(5, TimeUnit.SECONDS), "the interceptor is not left waiting");
+                // The thread stays interrupted, as it does for a call that
+                // waits: what the interceptor then waits on returns at once.
+                assertEquals("[Canceled, interrupted while waiting]", seen.toString());
+                assertTrue(f.isCancelled());
+                assertEquals(0L, client.stats().get("pending").longValue());
+
+                // The thread that ran it is none the worse: the next call is made.
+                server.mute = false;
+                assertEquals(Value.utf8("Hello, x!"),
+                        client.callFunctionAsync("greet", Value.list(Value.utf8("x")), null).get(5, TimeUnit.SECONDS));
+            }
+            // A closed client fails such a call, and does not throw.
+            final VrpcClient closed = clientOf(server).interceptors(waits).build();
+            closed.close();
+            final ExecutionException e = assertThrows(ExecutionException.class,
+                    () -> closed.callFunctionAsync("greet", null, null).get(5, TimeUnit.SECONDS));
+            assertSame(Code.UNAVAILABLE, ((VrpcException) e.getCause()).code());
+        });
+    }
+
+    @Test
     void metricsCountEveryCallOnceWithItsCode() throws Exception {
         overEachTransport(server -> {
             final ConcurrentLinkedQueue<String> seen = new ConcurrentLinkedQueue<String>();
@@ -414,5 +463,13 @@ class ClientTest {
         }
         assertThrows(IOException.class, () -> Transports.listener("carrier-pigeon://x", TransportOptions.DEFAULT));
         assertThrows(IllegalStateException.class, () -> VrpcClient.builder().build());
+        // QUIC is a module of its own, as in the Go implementation: its address says where it is.
+        assertTrue(assertThrows(IOException.class, () -> Transports.listener("quic://127.0.0.1:0", TransportOptions.DEFAULT))
+                .getMessage().contains("com.arpabet:value-rpc-quic"));
+        try (VrpcClient quic = VrpcClient.builder().address("quic://127.0.0.1:9000").build()) {
+            final VrpcException e = failure(quic::connect);
+            assertSame(Code.UNAVAILABLE, e.code());
+            assertTrue(e.detail().contains("com.arpabet:value-rpc-quic (QuicTransport.dialer)"), e.detail());
+        }
     }
 }

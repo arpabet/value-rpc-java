@@ -1,6 +1,8 @@
 rootProject.name = "value-rpc-java"
 
 include("value-rpc")
+include("value-rpc-resilience")
+include("value-rpc-quic")
 
 // A checkout of value-java next to this repository stands in for
 // com.arpabet:value, whatever its version: both are then built from source,

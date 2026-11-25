@@ -211,8 +211,9 @@ class GoQuicInteropTest {
         // The client sends all it has and ends its side before it reads
         // anything: more comes back after that than the server had credit
         // for, so the client has to go on granting credit, with its side
-        // ended. By the rules of the Go transport it could not, and the chat
-        // stopped for good after 4096 values, the credit of one window.
+        // ended. By the rules the Go transport had up to v1.7.1 it could not,
+        // and the chat stopped for good after 4096 values, the credit of one
+        // window.
         final int n = 10_000;
         try (VrpcClient client = clientOf(server.quic()).build();
                 Chat chat = client.chat("chat.echo", null, CallOptions.DEFAULT)) {

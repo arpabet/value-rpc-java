@@ -51,14 +51,21 @@ class GoClientInteropTest {
         GoServer.build("client");
     }
 
-    /** Runs the Go client against an address with scenarios, and gives what it said. */
+    /**
+     * Runs the Go client against an address with scenarios, and gives what it
+     * said: how it ended, and what it wrote to its standard output, which is
+     * where it says how each scenario went. What its libraries log is not part
+     * of that and goes to the log of the test, as the log of the Go server
+     * does: on Linux quic-go warns there that the receive buffer of its socket
+     * is smaller than it would like.
+     */
     private static String goClient(String address, List<String> more, String... scenarios) throws Exception {
         final List<String> command = new ArrayList<String>();
         command.add(GoServer.build("client").toString());
         command.addAll(Arrays.asList("-quic", address, "-ca", ca.getAbsolutePath()));
         command.addAll(more);
         command.addAll(Arrays.asList(scenarios));
-        final Process p = new ProcessBuilder(command).redirectErrorStream(true).start();
+        final Process p = new ProcessBuilder(command).redirectError(ProcessBuilder.Redirect.INHERIT).start();
         p.getOutputStream().close();
         final ByteArrayOutputStream said = new ByteArrayOutputStream();
         try (InputStream in = p.getInputStream()) {

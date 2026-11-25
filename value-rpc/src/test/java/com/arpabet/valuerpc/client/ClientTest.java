@@ -23,6 +23,7 @@ import com.arpabet.valuerpc.FakeServer;
 import com.arpabet.valuerpc.HashChain;
 import com.arpabet.valuerpc.MessageType;
 import com.arpabet.valuerpc.Metrics;
+import com.arpabet.valuerpc.ValueSink;
 import com.arpabet.valuerpc.VrpcException;
 import com.arpabet.valuerpc.transport.TransportOptions;
 import com.arpabet.valuerpc.transport.Transports;
@@ -32,8 +33,10 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -259,6 +262,67 @@ class ClientTest {
                 }
                 assertEquals(2L, client.stats().get("reconnects").longValue());
                 assertEquals("[connected, disconnected, connected, disconnected, connected]", events.toString());
+            }
+        });
+    }
+
+    /** Opens a stream to the server, which takes it and has room for a hundred values. */
+    private static ValueSink sinkOf(VrpcClient client, FakeServer server, String name) throws Exception {
+        final CompletableFuture<ValueSink> opening =
+                CompletableFuture.supplyAsync(() -> client.putStream(name, null, CallOptions.DEFAULT));
+        final MapValue request = server.next(5000);
+        assertNotNull(request, "the request of the stream " + name);
+        assertSame(MessageType.PUT_STREAM_REQUEST, D.messageType(request));
+        // The credit before the word that the stream is taken: it is there
+        // when the stream is handed to the application.
+        server.push(D.streamCredit(D.requestId(request), 100));
+        server.push(D.streamReady(D.requestId(request)));
+        return opening.get(5, TimeUnit.SECONDS);
+    }
+
+    @Test
+    void aStreamOfALostConnectionSaysSoFromTheMomentTheConnectionIsLost() throws Exception {
+        overEachTransport(server -> {
+            // A lost connection fails the requests on it one after the other.
+            // The metrics are told of each as it is taken out of the pending
+            // ones, before the request is told itself: the test holds the
+            // first there. One stream is then taken out and not yet told why,
+            // the other is not yet come to, and the connection is gone for
+            // both. Sending on either has to say that the connection is lost,
+            // and not that the stream is closed, which is what an application
+            // was told when it came between the loss and the news of it.
+            final CountDownLatch held = new CountDownLatch(1);
+            final CountDownLatch release = new CountDownLatch(1);
+            final AtomicBoolean first = new AtomicBoolean(true);
+            final Metrics metrics = new Metrics() {
+                @Override
+                public void requestEnd(String method, Code code, long elapsedNanos) {
+                    if (code == Code.UNAVAILABLE && first.compareAndSet(true, false)) {
+                        held.countDown();
+                        try {
+                            release.await(10, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                }
+            };
+            try (VrpcClient client = clientOf(server).metrics(metrics).build()) {
+                final ValueSink one = sinkOf(client, server, "one");
+                final ValueSink two = sinkOf(client, server, "two");
+                one.send(Value.ofLong(1));
+                two.send(Value.ofLong(1));
+                server.drop();
+                assertTrue(held.await(10, TimeUnit.SECONDS), "the loss of the connection came to the first stream");
+                try {
+                    for (ValueSink sink : new ValueSink[] {one, two}) {
+                        final VrpcException e = assertThrows(VrpcException.class, () -> sink.send(Value.ofLong(2)));
+                        assertSame(Code.UNAVAILABLE, e.code(), "stream " + sink.requestId() + ": " + e.getMessage());
+                        assertEquals("connection lost during reconnect", e.detail());
+                    }
+                } finally {
+                    release.countDown();
+                }
             }
         });
     }

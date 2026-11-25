@@ -11,7 +11,8 @@ import com.arpabet.valuerpc.MessageType;
  * How requests map to QUIC streams: who opens the stream of a request, and
  * when each side has sent the last it will send on one, so that it can end
  * its half of the stream. Both ends have to agree on this, or streams are
- * never freed; it is the Go implementation's {@code quic/transport.go}.
+ * never freed; it is the Go implementation's {@code quic/transport.go}, as
+ * of value-rpc v1.7.2.
  *
  * <p>A request has a stream of its own. The side that makes the request opens
  * it with the message that opens the request; every later message of that
@@ -46,11 +47,24 @@ final class StreamRules {
      * it said it is ready, so that does not end its half: reading the end of
      * the stream does.
      *
+     * <p>A chat is both at once for the side that opened it: it streams to
+     * the peer, and the peer streams to it. The end of what it streams does
+     * not end its half. The chat goes on after that: the peer still streams,
+     * until it ends the chat, and has to be granted credit for what it sends.
+     * With its half ended this side could grant none, and the peer would stop
+     * after the values it had credit for, for good. The Go implementation
+     * did end the half there up to value-rpc v1.7.1, and a chat it had opened
+     * and ended first stopped that way.
+     *
      * @param originatedHere whether this side made the request
      * @param sent           the message it sends
+     * @param request        the message that opened the request
      */
-    static boolean goFinOnWrite(boolean originatedHere, MessageType sent) {
+    static boolean goFinOnWrite(boolean originatedHere, MessageType sent, MessageType request) {
         if (originatedHere) {
+            if (request == MessageType.CHAT_REQUEST && sent == MessageType.STREAM_END) {
+                return false;
+            }
             return sent == MessageType.STREAM_END || sent == MessageType.CANCEL_REQUEST;
         }
         return sent == MessageType.HANDSHAKE_RESPONSE || sent == MessageType.FUNCTION_RESPONSE
@@ -61,6 +75,10 @@ final class StreamRules {
      * Whether a message this side reads means that it will send no more on
      * the stream, as the Go implementation decides it ({@code finOnRead}).
      *
+     * <p>For the side that opened a chat that is the message the peer ends
+     * the chat with: the end of what the peer streams, whether or not this
+     * side had sent its own, or the failure the peer refuses or fails it with.
+     *
      * @param received       the message it read
      * @param request        the message that opened the request
      * @param originatedHere whether this side made the request
@@ -70,7 +88,7 @@ final class StreamRules {
             if (request == MessageType.FUNCTION_REQUEST) {
                 return received == MessageType.FUNCTION_RESPONSE || received == MessageType.ERROR_RESPONSE;
             }
-            if (request == MessageType.GET_STREAM_REQUEST) {
+            if (request == MessageType.GET_STREAM_REQUEST || request == MessageType.CHAT_REQUEST) {
                 return received == MessageType.STREAM_END || received == MessageType.ERROR_RESPONSE;
             }
             if (request == MessageType.HANDSHAKE_REQUEST) {
@@ -98,7 +116,7 @@ final class StreamRules {
 
     /**
      * Whether to end this side's half of the stream after sending a message.
-     * It is what the Go implementation does, but for two things.
+     * It is what the Go implementation does, and one thing more.
      *
      * <p>A half is also ended after any message that ends the request for
      * both sides. The Go implementation leaves it open in a few of those
@@ -107,42 +125,20 @@ final class StreamRules {
      * it: it reads the end of the stream as the peer being done, which is the
      * truth.
      *
-     * <p>And the side that opened a chat does not end its half with the end
-     * of what it streams, as the Go implementation does. A chat goes on after
-     * that: the peer still streams, until it ends the chat, and has to be
-     * granted credit for what it sends. With its half ended this side could
-     * grant none, and the peer would stop after the values it had credit for,
-     * for good. The half is ended when the peer ends the chat (see
-     * {@link #finOnRead}).
-     *
      * @param originatedHere whether this side made the request
      * @param sent           the message it sends
      * @param request        the message that opened the request
      */
     static boolean finOnWrite(boolean originatedHere, MessageType sent, MessageType request) {
-        if (endsTheRequest(sent)) {
-            return true;
-        }
-        if (originatedHere && request == MessageType.CHAT_REQUEST && sent == MessageType.STREAM_END) {
-            return false;
-        }
-        return goFinOnWrite(originatedHere, sent);
+        return endsTheRequest(sent) || goFinOnWrite(originatedHere, sent, request);
     }
 
     /**
      * Whether to end this side's half of the stream after reading a message:
-     * when the Go implementation would, after any message that ends the
-     * request, and, for the side that opened a chat, when the peer ends what
-     * it streams, which ends the chat: whether or not this side had sent its
-     * last, it sends nothing after that. See {@link #finOnWrite}.
+     * when the Go implementation would, and after any message that ends the
+     * request. See {@link #finOnWrite}.
      */
     static boolean finOnRead(MessageType received, MessageType request, boolean originatedHere) {
-        if (endsTheRequest(received)) {
-            return true;
-        }
-        if (originatedHere && request == MessageType.CHAT_REQUEST && received == MessageType.STREAM_END) {
-            return true;
-        }
-        return goFinOnRead(received, request, originatedHere);
+        return endsTheRequest(received) || goFinOnRead(received, request, originatedHere);
     }
 }

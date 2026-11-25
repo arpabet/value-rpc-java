@@ -271,7 +271,7 @@ final class ClientImpl implements VrpcClient {
         reconnects.incrementAndGet();
         metrics.reconnect();
         // Requests made from here on belong to the next connection.
-        failAll(lastRequest.get(), "connection lost during reconnect");
+        failAll(lastRequest.get(), LOST);
         listener.onDisconnected(cause);
         try {
             connect();
@@ -279,6 +279,9 @@ final class ClientImpl implements VrpcClient {
             // The next call connects.
         }
     }
+
+    /** What a request is told that was on a connection when it was lost, as the Go client words it. */
+    private static final String LOST = "connection lost during reconnect";
 
     private void failAll(long upTo, String why) {
         for (Pending p : pending.values()) {
@@ -311,6 +314,12 @@ final class ClientImpl implements VrpcClient {
         final String name;
         final long startNanos = System.nanoTime();
         volatile ScheduledFuture<?> timeout;
+        /**
+         * Why the request failed; null while it is not over, and when it
+         * ended well. Written under the monitor of the request, in the step
+         * that takes it out of the pending ones ({@code retireFailed}).
+         */
+        volatile VrpcException error;
 
         Pending(long id, String name) {
             this.id = id;
@@ -382,32 +391,65 @@ final class ClientImpl implements VrpcClient {
         if (!pending.remove(p.id, p)) {
             return false;
         }
+        retired(p, code);
+        return true;
+    }
+
+    /**
+     * Retires a request that failed, and leaves with it why. For whoever
+     * looks at the request under its monitor the two are one step: a stream
+     * that finds itself taken out of the pending ones can say why
+     * ({@code StreamCall.gone}), also when the one that failed it has not yet
+     * come to tell it ({@code Pending.failed}). Without that, an application
+     * that sent on a stream between the two was told the stream is closed,
+     * where its connection had been lost.
+     */
+    private boolean retireFailed(Pending p, VrpcException error) {
+        synchronized (p) {
+            if (!pending.remove(p.id, p)) {
+                return false;
+            }
+            p.error = error;
+        }
+        retired(p, error.code());
+        return true;
+    }
+
+    /** What follows taking a request out, of whichever kind. Not under its monitor: the metrics are the application's. */
+    private void retired(Pending p, Code code) {
         final ScheduledFuture<?> t = p.timeout;
         if (t != null) {
             t.cancel(false);
         }
         metrics.requestEnd(p.name, code, System.nanoTime() - p.startNanos);
-        return true;
     }
 
     private void fail(Pending p, VrpcException error) {
-        if (retire(p, error.code())) {
+        if (retireFailed(p, error)) {
             p.failed(error);
         }
     }
 
     /** The caller gave up: the peer is told, and the request is retired here, since a cancel is not answered. */
     private void cancel(Pending p) {
-        if (retire(p, Code.CANCELED)) {
+        if (pending.get(p.id) != p) {
+            return; // over already: closing a stream that has ended comes here
+        }
+        final VrpcException canceled = new VrpcException(Code.CANCELED, "request " + p.id + " canceled");
+        if (retireFailed(p, canceled)) {
             tellCancel(p.id);
-            p.failed(new VrpcException(Code.CANCELED, "request " + p.id + " canceled"));
+            p.failed(canceled);
         }
     }
 
     private void timedOut(Pending p) {
-        if (!p.taken() && retire(p, Code.DEADLINE_EXCEEDED)) {
+        if (p.taken() || pending.get(p.id) != p) {
+            return;
+        }
+        final VrpcException timeout = new VrpcException(Code.DEADLINE_EXCEEDED, "timeout");
+        if (retireFailed(p, timeout)) {
             tellCancel(p.id);
-            p.failed(new VrpcException(Code.DEADLINE_EXCEEDED, "timeout"));
+            p.failed(timeout);
         }
     }
 
@@ -538,7 +580,6 @@ final class ClientImpl implements VrpcClient {
         final StreamBuffer in;
         /** The credit to send with; null when this side sends nothing. */
         final CreditGate out;
-        private volatile VrpcException error;
         /** This side has ended what it sends. */
         private volatile boolean outEnded;
         /** Values taken since credit was last granted. Only the thread that reads the stream touches it. */
@@ -572,10 +613,11 @@ final class ClientImpl implements VrpcClient {
                         } else if (in.overflowed()) {
                             // The server sent more than it had credit for:
                             // the stream is cut short, and says so.
-                            if (retire(this, Code.RESOURCE_EXHAUSTED)) {
+                            final VrpcException truncated = new VrpcException(Code.RESOURCE_EXHAUSTED,
+                                    "stream " + id + " truncated: server exceeded flow-control credit");
+                            if (retireFailed(this, truncated)) {
                                 tellCancel(id);
-                                failed(new VrpcException(Code.RESOURCE_EXHAUSTED,
-                                        "stream " + id + " truncated: server exceeded flow-control credit"));
+                                failed(truncated);
                             }
                         }
                     }
@@ -621,7 +663,8 @@ final class ClientImpl implements VrpcClient {
 
         @Override
         void failed(VrpcException e) {
-            error = e;
+            // Why is with the stream already (retireFailed): what follows
+            // lets go of whoever waits on it, and they ask.
             ready.completeExceptionally(e);
             if (in != null) {
                 in.stop();
@@ -648,8 +691,15 @@ final class ClientImpl implements VrpcClient {
             }
         }
 
+        /** Why this stream takes no more: what failed it, or else that it is over. */
         private VrpcException gone() {
-            final VrpcException e = error;
+            final VrpcException e;
+            // Under the monitor a failed stream is retired under: one that is
+            // being failed as this asks has been given its reason by the time
+            // this is let in.
+            synchronized (this) {
+                e = error;
+            }
             return e != null ? e : new VrpcException(Code.CANCELED, "stream " + id + " is closed");
         }
 
@@ -675,8 +725,18 @@ final class ClientImpl implements VrpcClient {
             if (!out.acquire()) {
                 throw gone();
             }
+            if (pending.get(id) != this) {
+                throw gone();
+            }
             final Connection c = connection.get();
-            if (c == null || pending.get(id) != this || !c.send(dialect.streamValue(Value.ofLong(id), value))) {
+            if (c == null || !c.send(dialect.streamValue(Value.ofLong(id), value))) {
+                if (c == null || !c.isOpen()) {
+                    // There is no connection to send on: it is lost, or the
+                    // client is closed, and this stream with it. What deals
+                    // with that may not have come to this stream yet, so it
+                    // is said here: the reason is the same whoever says it.
+                    fail(this, closed ? clientClosed() : new VrpcException(Code.UNAVAILABLE, LOST));
+                }
                 throw gone();
             }
             metrics.streamValue(name);

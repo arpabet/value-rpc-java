@@ -28,7 +28,7 @@ Android 8.0 (API 26), which the build checks. `value-rpc-quic` brings Netty's
 QUIC codec, which is native code, for a JVM and not for Android.
 
 It speaks the protocol of value-rpc v1.7, and every release is tested against
-the Go implementation: 0.1.0 against v1.7.1, the Java client with the Go
+the Go implementation: 0.1.0 against v1.7.2, the Java client with the Go
 server over TCP, TLS and QUIC, and the Go client with the Java QUIC listener.
 
 ## What is there

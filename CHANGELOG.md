@@ -14,7 +14,7 @@ Nothing yet.
 The first release: the client of a vRPC server, for Android and the JVM, in
 three modules. It speaks the wire protocol of
 [`go.arpabet.com/value-rpc`](https://github.com/arpabet/value-rpc) v1.7, the
-reference implementation, and is tested against v1.7.1 of it.
+reference implementation, and is tested against v1.7.2 of it.
 
 ### Added
 
@@ -67,10 +67,11 @@ reference implementation, and is tested against v1.7.1 of it.
 - Where the QUIC transport differs from the Go one, a peer does not have to
   know: [MIGRATION_PLAN.md](MIGRATION_PLAN.md) lists it under Progress.
 - A Go peer older than value-rpc v1.7.1 does not notice a QUIC connection that
-  this side closed until it next writes; v1.7.1 does.
+  this side closed until it next writes; from v1.7.1 on it does.
 - A chat over QUIC: the side that opened it keeps its half of the stream after
   it has sent its last, to grant the peer credit for what the peer still
-  sends, and ends it when the peer ends the chat. The Go transport, v1.7.1
-  included, ends the half with the last value, and a chat whose Go side opened
-  it and ended first stops after one window of credit (4096 values by
-  default). A Java client with a Go server is not affected.
+  sends, and ends it when the peer ends the chat. The Go transport does the
+  same from value-rpc v1.7.2 on. An older one ends the half with the last
+  value, and a chat that it opened and ended first stops after one window of
+  credit (4096 values by default). A Java client with a Go server is not
+  affected.

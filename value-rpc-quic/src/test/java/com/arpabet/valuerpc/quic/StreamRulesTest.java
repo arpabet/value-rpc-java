@@ -31,8 +31,9 @@ import org.junit.jupiter.api.Test;
 /**
  * Who opens a stream and when each side ends its half of one: the rules of
  * the Go implementation ({@code finOnWrite}, {@code finOnRead} and
- * {@code streamForWrite} of {@code quic/transport.go}), case by case, and
- * what this implementation adds to them.
+ * {@code streamForWrite} of {@code quic/transport.go}, as of value-rpc
+ * v1.7.2, whose {@code TestQUIC_FinRules} is the same table), case by case,
+ * and what this implementation adds to them.
  */
 class StreamRulesTest {
 
@@ -60,8 +61,14 @@ class StreamRulesTest {
         // Its own end of what it streams, or its cancellation. Not the
         // request: of a stream from the peer it still sends credit.
         final Set<MessageType> last = of(STREAM_END, CANCEL_REQUEST);
+        // Of a chat, its cancellation only: the peer still streams after the
+        // end of what this side streams, and is granted credit for it.
+        final Set<MessageType> lastOfAChat = of(CANCEL_REQUEST);
         for (MessageType sent : MessageType.values()) {
-            assertEquals(last.contains(sent), StreamRules.goFinOnWrite(true, sent), "sending " + sent);
+            for (MessageType request : REQUESTS) {
+                assertEquals((request == CHAT_REQUEST ? lastOfAChat : last).contains(sent),
+                        StreamRules.goFinOnWrite(true, sent, request), "sending " + sent + " of " + request);
+            }
         }
     }
 
@@ -71,7 +78,10 @@ class StreamRulesTest {
         // stream to it, it still sends credit after that.
         final Set<MessageType> last = of(HANDSHAKE_RESPONSE, FUNCTION_RESPONSE, ERROR_RESPONSE, STREAM_END);
         for (MessageType sent : MessageType.values()) {
-            assertEquals(last.contains(sent), StreamRules.goFinOnWrite(false, sent), "sending " + sent);
+            for (MessageType request : REQUESTS) {
+                assertEquals(last.contains(sent), StreamRules.goFinOnWrite(false, sent, request),
+                        "sending " + sent + " of " + request);
+            }
         }
     }
 
@@ -84,9 +94,11 @@ class StreamRulesTest {
                     StreamRules.goFinOnRead(received, FUNCTION_REQUEST, true), "a call, reading " + received);
             assertEquals(of(STREAM_END, ERROR_RESPONSE).contains(received),
                     StreamRules.goFinOnRead(received, GET_STREAM_REQUEST, true), "a stream from the peer, reading " + received);
+            // A chat is over when the peer ends what it streams, or fails it.
+            assertEquals(of(STREAM_END, ERROR_RESPONSE).contains(received),
+                    StreamRules.goFinOnRead(received, CHAT_REQUEST, true), "a chat, reading " + received);
             // Of what it streams itself it is done when it sends its end.
             assertFalse(StreamRules.goFinOnRead(received, PUT_STREAM_REQUEST, true), "a stream to the peer, reading " + received);
-            assertFalse(StreamRules.goFinOnRead(received, CHAT_REQUEST, true), "a chat, reading " + received);
         }
     }
 
@@ -112,18 +124,12 @@ class StreamRulesTest {
 
     private static final boolean[] EITHER = {true, false};
 
-    /** The one case in which this implementation does otherwise than the Go one where that one ends a half. */
-    private static boolean endOfAChatByWhoOpenedIt(boolean originatedHere, MessageType message, MessageType request) {
-        return originatedHere && request == CHAT_REQUEST && message == STREAM_END;
-    }
-
     @Test
-    void whereTheGoImplementationEndsAHalfThisOneDoesTooButForWhoOpenedAChat() {
+    void whereTheGoImplementationEndsAHalfThisOneDoesToo() {
         for (MessageType message : MessageType.values()) {
             for (boolean originatedHere : EITHER) {
                 for (MessageType request : REQUESTS) {
-                    if (StreamRules.goFinOnWrite(originatedHere, message)
-                            && !endOfAChatByWhoOpenedIt(originatedHere, message, request)) {
+                    if (StreamRules.goFinOnWrite(originatedHere, message, request)) {
                         assertTrue(StreamRules.finOnWrite(originatedHere, message, request),
                                 "sending " + message + " of " + request);
                     }
@@ -153,14 +159,19 @@ class StreamRulesTest {
     }
 
     @Test
-    void whoOpenedAChatKeepsItsHalfUntilThePeerEndsTheChat() {
-        // Otherwise than the Go implementation, which ends the half with the
-        // end of what that side streams. A chat goes on after that: the peer
-        // still streams, and has to be granted credit for it.
-        assertTrue(StreamRules.goFinOnWrite(true, STREAM_END), "the Go implementation ends the half");
+    void whoOpenedAChatKeepsItsHalfUntilThePeerEndsTheChatAsInGo() {
+        // The end of what that side streams does not end its half. A chat
+        // goes on after that: the peer still streams, and has to be granted
+        // credit for it. The Go implementation has it so since value-rpc
+        // v1.7.2; up to v1.7.1 it ended the half there, and this one did not.
+        assertFalse(StreamRules.goFinOnWrite(true, STREAM_END, CHAT_REQUEST));
         assertFalse(StreamRules.finOnWrite(true, STREAM_END, CHAT_REQUEST), "the half stays, for the credit of the peer");
+        // Of any other request it does.
+        for (MessageType request : new MessageType[] {HANDSHAKE_REQUEST, FUNCTION_REQUEST, GET_STREAM_REQUEST, PUT_STREAM_REQUEST}) {
+            assertTrue(StreamRules.finOnWrite(true, STREAM_END, request), "the end of what it streams, of " + request);
+        }
         // The peer ending what it streams ends the chat: nothing is sent after it.
-        assertFalse(StreamRules.goFinOnRead(STREAM_END, CHAT_REQUEST, true), "the Go implementation leaves the half open");
+        assertTrue(StreamRules.goFinOnRead(STREAM_END, CHAT_REQUEST, true));
         assertTrue(StreamRules.finOnRead(STREAM_END, CHAT_REQUEST, true));
         // What travels in between ends nothing.
         for (MessageType between : new MessageType[] {STREAM_READY, STREAM_VALUE, STREAM_CREDIT}) {
@@ -189,10 +200,7 @@ class StreamRulesTest {
             }
             for (boolean originatedHere : EITHER) {
                 for (MessageType request : REQUESTS) {
-                    if (endOfAChatByWhoOpenedIt(originatedHere, message, request)) {
-                        continue;
-                    }
-                    assertEquals(StreamRules.goFinOnWrite(originatedHere, message),
+                    assertEquals(StreamRules.goFinOnWrite(originatedHere, message, request),
                             StreamRules.finOnWrite(originatedHere, message, request),
                             "sending " + message + " of " + request);
                     assertEquals(StreamRules.goFinOnRead(message, request, originatedHere),

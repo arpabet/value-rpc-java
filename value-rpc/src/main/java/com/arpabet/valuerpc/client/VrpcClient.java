@@ -10,6 +10,7 @@ import com.arpabet.valuerpc.ClientInterceptor;
 import com.arpabet.valuerpc.Dialect;
 import com.arpabet.valuerpc.Metrics;
 import com.arpabet.valuerpc.Peer;
+import com.arpabet.valuerpc.Registrar;
 import com.arpabet.valuerpc.VrpcException;
 import com.arpabet.valuerpc.transport.Dialer;
 import com.arpabet.valuerpc.transport.TransportOptions;
@@ -34,8 +35,21 @@ import java.util.function.Supplier;
  * A client connects when it is first used, and again after its connection is
  * lost. It is safe to use from many threads, and one connection carries all
  * their calls at once.
+ *
+ * <p>A connection is used in both directions. What a client registers
+ * ({@link Registrar}) its server may ask of it, once the client is
+ * connected: a call, or any of the three streams. A name registered again
+ * serves the new handler from then on.
+ *
+ * <pre>{@code
+ * client.addFunction("notify", (context, args) -> {
+ *     show(args);
+ *     return null;
+ * });
+ * client.connect();                    // the server can reach it from here on
+ * }</pre>
  */
-public interface VrpcClient extends Peer, Closeable {
+public interface VrpcClient extends Peer, Registrar, Closeable {
 
     /** The default time a call may take: one second, as in the Go implementation. */
     long DEFAULT_TIMEOUT_MILLIS = 1000;
@@ -48,6 +62,9 @@ public interface VrpcClient extends Peer, Closeable {
 
     /** The default number of values of a stream that may wait to be taken: the credit a sender is granted. */
     int DEFAULT_STREAM_WINDOW = 4096;
+
+    /** The default number of calls of the server that may be served at once. */
+    long DEFAULT_MAX_CONCURRENT_INBOUND = 1024;
 
     static Builder builder() {
         return new Builder();
@@ -102,6 +119,7 @@ public interface VrpcClient extends Peer, Closeable {
         long dialTimeoutMillis = DEFAULT_DIAL_TIMEOUT_MILLIS;
         int sendQueue = DEFAULT_SEND_QUEUE;
         int streamWindow = DEFAULT_STREAM_WINDOW;
+        long maxConcurrentInbound = DEFAULT_MAX_CONCURRENT_INBOUND;
         Value credential;
         Supplier<Map<String, String>> metadata;
         Metrics metrics = Metrics.NONE;
@@ -173,6 +191,19 @@ public interface VrpcClient extends Peer, Closeable {
                 throw new IllegalArgumentException("stream window " + values);
             }
             this.streamWindow = values;
+            return this;
+        }
+
+        /**
+         * How many calls of the server this client serves at once; 0 for any
+         * number. One too many is answered {@code RESOURCE_EXHAUSTED}, and
+         * the ones that run are not disturbed. Streams are not counted.
+         */
+        public Builder maxConcurrentInbound(long calls) {
+            if (calls < 0) {
+                throw new IllegalArgumentException("max concurrent inbound " + calls);
+            }
+            this.maxConcurrentInbound = calls;
             return this;
         }
 

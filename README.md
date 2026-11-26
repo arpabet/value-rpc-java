@@ -38,16 +38,18 @@ server over TCP, TLS and QUIC, and the Go client with the Java QUIC listener.
 | | State |
 |---|---|
 | The protocol: envelopes, codes, hash chain, argument verification, framing, MessagePack and JSON wire codecs | done; checked against fixtures the Go implementation writes |
-| Transports: TCP (with SOCKS5), in-memory, a stream of one's own (which is how to use [TLS](#tls) for now) | done |
+| Transports: TCP (with SOCKS5), in-memory, a stream of one's own | done |
 | Client: calls, timeouts, cancellation, metadata, credentials, interceptors, metrics, reconnect with session resumption | done; checked against the Go server |
 | Client: the three kinds of stream, with credit-based flow control | done; checked against the Go server |
 | Resilience: retry, circuit breaker, timeout, fallback, bulkhead, rate limit (`value-rpc-resilience`) | done; the tests of the Go module, and checked against the Go server |
 | QUIC transport: a dialer for a client, a listener for a server (`value-rpc-quic`) | done; checked against the Go server and the Go client. For a JVM, not for Android |
 | Server: calls and the three kinds of stream with their flow control, deadlines, cancellation, metadata, an authenticator and a connect-authorizer, sessions that a client resumes, limits, closing that writes what is queued | done, not released; checked against the Go client and against the JS client (`@arpabet/vrpc`) |
 | WebSocket listener, for browsers: both codecs by subprotocol, origins, ping, the close (in the core, on plain sockets) | done, not released; checked against the WebSocket clients of the JDK, of Go and of Node |
-| Client: serving the calls and streams a server opens on it; replay of calls after a reconnect | not yet |
-| Server: calling its clients | not yet |
-| A `tls://` transport of the library's own; a WebSocket client; `wss://`; a WebSocket listener on Netty, for many connections | not yet |
+| [Both directions](#both-directions): a server asks its clients, and a client serves what it is asked, by every pattern | done, not released; checked in every pairing with the Go implementation, and against the JS client, whose conformance suite passes whole (19 scenarios in each codec) |
+| WebSocket client (`ws://`), in the core, on plain sockets: runs on Android | done, not released; checked against the WebSocket servers of this library and of Go |
+| [TLS](#tls): `tls://` and `wss://`, to dial and to listen on, with the certificate checked against the host, and certificates of clients | done, not released; checked against the TLS and the WebSocket servers of Go, and with the Go client |
+| Client: replay of calls after a reconnect | not yet |
+| A WebSocket listener on Netty, for many connections; `unix://` | not yet |
 
 ## A call
 
@@ -145,8 +147,54 @@ takes over nobody's session. What a client had asked on the connection it
 lost is cancelled, since the client has given it up too. The session of a
 client that does not come back is dropped after two minutes.
 
-What a server does not do yet is call its clients: the reverse direction is
-not served by the client of this library either.
+## Both directions
+
+A connection is used both ways: which side dialed is how the connection came
+to be, and either side may ask the other. A client registers what it serves
+as a server does, and a server asks a client through the `Peer` of a request,
+which is the client that made it:
+
+```java
+// the client serves a call, and a stream to the server
+client.addFunction("notify", (context, args) -> {
+    show(args);
+    return null;
+});
+client.addOutgoingStream("log.tail", TypeDef.ANY, (context, args, out) -> {
+    for (String line : log.since(args)) {
+        out.send(Value.utf8(line));
+    }
+});
+client.connect();                                      // the server can reach it from here on
+
+// the server asks the client whose request it serves
+server.addFunction("job.start", (context, args) -> {
+    Peer client = context.peer();
+    client.callFunction("notify", Value.utf8("started"));
+    try (ValueStream lines = client.getStream("log.tail", null, CallOptions.DEFAULT)) {
+        for (Value line : lines) {
+            keep(line);
+        }
+    }
+    return Value.utf8("done");
+});
+```
+
+`Peer` is what a client is to its application too: `callFunction`,
+`getStream`, `putStream`, `chat`. The peer of a request on a server is its
+client across the connections of that client: a server may keep it, by who
+the client is say, and ask it later from another thread. What is asked while
+the client is not connected fails at once with `UNAVAILABLE`, and so does
+what was under way when its connection was lost or the client came back on
+another. A server names no time for a call of its own: it waits for as long
+as its caller does, unless the options of the call say
+(`CallOptions.timeoutMillis`); a client has ten seconds to take a stream.
+
+A handler of a client is told about its request as one of a server is, and
+is interrupted when the server gives the request up or the connection is
+lost. A client serves 1024 calls of its server at once
+(`maxConcurrentInbound`), and a name registered again serves the new handler,
+where a server refuses a name that is taken: both as the Go client has it.
 
 ## WebSocket
 
@@ -174,9 +222,26 @@ closed when it does not answer.
 
 The listener is in the core, on plain sockets, with a thread for each
 connection, as the TCP listener: enough for the tools and the services of a
-team, and for tests. It does not serve TLS (put it behind what ends TLS for
-the site), and takes no compression. A listener on Netty, for many
-connections, is still to come, as is a WebSocket client.
+team, and for tests. It takes no compression. A listener on Netty, for many
+connections, is still to come.
+
+A client reaches a server through WebSocket too, where the server is behind
+an HTTP port and nothing else: `ws://` as the address of a client, and
+`wss://` over [TLS](#tls). It is written on sockets, with nothing of the
+JDK that Android lacks, so an Android app uses it as a JVM does.
+
+```java
+VrpcClient client = VrpcClient.builder().address("wss://api.example.com/rpc").build();
+
+// JSON in place of MessagePack, or another ping
+Dialer json = Transports.webSocketDialer("wss://api.example.com/rpc", TransportOptions.DEFAULT,
+        WebSocketOptions.DEFAULT.withCodecs(WireCodec.JSON));
+VrpcClient client = VrpcClient.builder().dialer(json).build();
+```
+
+The port is that of HTTP when the address has none, 80 or 443. The client
+offers its codec as a subprotocol and connects only to a server that takes
+it, as the Go client does: a server that names none predates the negotiation.
 
 ## Streams
 
@@ -209,41 +274,38 @@ no other request on the connection.
 
 ## TLS
 
-The library has no `tls://` transport yet. Until it has, a client takes a TLS
-socket the application makes, as a stream of its own: the protocol is the same
-on it, and a Go server on `valueserver.NewTLSServer` is at the other end. The
-dialer is asked for a connection whenever the client connects, also after a
-connection was lost.
+`tls://` is the protocol over a TLS socket, framed as over TCP, and `wss://`
+is WebSocket over one. The keys and the trust are an `SSLContext`, given with
+the options of the transport:
 
 ```java
-SSLSocketFactory factory = (SSLSocketFactory) SSLSocketFactory.getDefault();   // or one of a context of one's own
+// a client: the certificate of the server has to be one the platform trusts, and for this host
+VrpcClient client = VrpcClient.builder().address("tls://api.example.com:9443").build();
 
-Dialer tls = Transports.dialer(timeoutMillis -> {
-    int timeout = (int) Math.max(0, Math.min(timeoutMillis, Integer.MAX_VALUE));
-    Socket plain = new Socket();
-    try {
-        plain.connect(new InetSocketAddress(host, port), timeout);
-        plain.setTcpNoDelay(true);
-        plain.setSoTimeout(timeout);                               // bounds the handshake
-        SSLSocket socket = (SSLSocket) factory.createSocket(plain, host, port, true);
-        SSLParameters parameters = socket.getSSLParameters();
-        parameters.setEndpointIdentificationAlgorithm("HTTPS");    // the certificate has to be for the host
-        socket.setSSLParameters(parameters);
-        socket.startHandshake();
-        socket.setSoTimeout(0);                                    // a connection may be silent
-        return new Transports.Stream(socket.getInputStream(), socket.getOutputStream(), socket, host + ":" + port);
-    } catch (IOException | RuntimeException e) {
-        plain.close();
-        throw e;
-    }
-}, TransportOptions.DEFAULT);
+// a client that trusts an authority of its own, or shows a certificate: a context of its own
+VrpcClient client = VrpcClient.builder().address("tls://api.example.com:9443")
+        .transportOptions(TransportOptions.DEFAULT.withTls(context))
+        .build();
 
-VrpcClient client = VrpcClient.builder().dialer(tls).build();
+// a server: the context has its certificate
+VrpcServer server = VrpcServer.builder().address("tls://0.0.0.0:9443")      // or wss://0.0.0.0:9443/rpc
+        .transportOptions(TransportOptions.DEFAULT.withTls(context)
+                .withClientAuth(true))                  // only clients that show a certificate the context trusts
+        .authenticator((conn, credential) ->            // who the client is, by the certificate it showed
+                nameOf(conn.tlsSession().getPeerCertificates()[0]))
+        .build();
 ```
 
-Without the line that sets the endpoint identification, a socket checks that
-the certificate is one it trusts and not that it is the server's. This dialer
-is in the tests as it is here, against the TLS listener of the Go server.
+A dialer checks that the certificate of the server is for the host of the
+address, as a browser and the Go implementation do; a socket of the platform
+does not check that by itself. The certificates a peer showed are with the
+connection (`MsgConn.tlsSession()`), for an authorizer or an authenticator of
+a server to go by.
+
+A TLS socket of the application's own making still serves, where the
+transport is to be set up in a way the options do not have: a client takes it
+as a stream (`Transports.dialer(StreamSource, TransportOptions)`), and the
+protocol is the same on it.
 
 ## Resilience
 
@@ -298,8 +360,10 @@ Listener listener = QuicTransport.listener("0.0.0.0:9000", QuicOptions.DEFAULT
 
 QUIC is always encrypted, so a listener needs a certificate. The module brings
 Netty and the native library for each platform Netty builds one for; a program
-that ships to one platform may exclude the others. There is no server in this
-library yet, so the listener serves the tests, and a server of one's own.
+that ships to one platform may exclude the others. A listener is what a server
+of this library listens on (`VrpcServer.builder().listen(listener)`), and a
+connection carries requests both ways as on any other transport, each on a
+stream of its own.
 
 ## Building
 
@@ -315,24 +379,33 @@ comes from Maven Central, as it does for a release.
 
 The tests that run against the Go implementation need a Go toolchain (1.25 or
 newer) and are skipped without one. They build `conformance/server`, a real
-value-rpc server on TCP, TLS, WebSocket and QUIC, and `conformance/client`,
-the Go client over QUIC, TCP and WebSocket, and talk to them: the Java client
-to the Go server, and the Go client to the Java server.
+value-rpc server on TCP, TLS, WebSocket (also over TLS) and QUIC, and
+`conformance/client`, the Go client over QUIC, TCP, TLS and WebSocket, and
+talk to them: the Java client to the Go server, and the Go client to the Java
+server, each also asked back by the server it called. The certificates of the
+tests over TLS are made by the `keytool` of the JDK that runs them.
 
 ```sh
 cd conformance
 go run ./golden          # writes the fixtures of value-rpc/src/test/resources/golden again
 go run ./server          # the Go server the tests talk to, by hand
 go run ./client -quic 127.0.0.1:9000 -ca ca.pem calls    # the Go client, against a QUIC listener
-go run ./client -ws ws://127.0.0.1:9001/rpc -codec json calls streams upload:1000 chat
+go run ./client -ws ws://127.0.0.1:9001/rpc -codec json calls streams upload:1000 chat reverse
+go run ./client -tls 127.0.0.1:9443 -ca server.pem calls                   # against a TLS listener
 
 cd .. && ./gradlew :value-rpc:conformanceServer    # the Java twin of the Go server, on TCP and WebSocket
 ```
 
-The Java twin has the functions of the Go server, but for the calls a server
-makes back to its client. It is what the conformance suite of value-rpc-js
-runs against when it is given the URL of a server in place of starting the Go
-one.
+The Java twin has the functions of the Go server, the ones that ask the
+client back among them. It is what the conformance suite of value-rpc-js runs
+against when it is given the command that starts a server, in place of
+starting the Go one; from a checkout of value-rpc-js beside this repository:
+
+```sh
+cd ../value-rpc-js/packages/vrpc
+VRPC_CONFORMANCE_SERVER='cd ../../../value-rpc-java && ./gradlew -q :value-rpc:conformanceServer' \
+  npx vitest run test/conformance.test.ts
+```
 
 Two workflows run on GitHub. `build.yaml` builds and tests every push on JDK
 17 and 21, checks that the committed fixtures are what the generator writes,

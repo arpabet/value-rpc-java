@@ -12,10 +12,11 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * What a WebSocket listener is set up with, on top of what every transport
- * is ({@link TransportOptions}): the codecs it serves, the pages that may
- * connect to it, and how it keeps a silent connection. The defaults are
- * those of the Go implementation. Immutable: each {@code with} gives another.
+ * What a WebSocket transport is set up with, on top of what every transport
+ * is ({@link TransportOptions}): the codecs a listener serves and the one a
+ * dialer speaks, the pages that may connect to a listener, and how a silent
+ * connection is kept. The defaults are those of the Go implementation.
+ * Immutable: each {@code with} gives another.
  */
 public final class WebSocketOptions {
 
@@ -40,9 +41,11 @@ public final class WebSocketOptions {
     }
 
     /**
-     * The codecs the listener serves, in its order of preference; empty for
+     * The codecs a listener serves, in its order of preference; empty for
      * both, MessagePack first. A client is served the first of them that it
      * offers as a subprotocol, and one that offers none is served the first.
+     * A dialer speaks the first of them, MessagePack when there is none: it
+     * offers that one, and connects only to a server that takes it.
      */
     public List<WireCodec> codecs() {
         return codecs;
@@ -69,7 +72,8 @@ public final class WebSocketOptions {
     /**
      * Serves these codecs only, in this order of preference: one of
      * {@link WireCodec#JSON} alone, say, for an endpoint that is JSON and
-     * nothing else. None gives both back.
+     * nothing else. None gives both back. For a dialer, the first is the
+     * codec it speaks.
      */
     public WebSocketOptions withCodecs(WireCodec... codecs) {
         return new WebSocketOptions(Collections.unmodifiableList(new ArrayList<WireCodec>(Arrays.asList(codecs))),

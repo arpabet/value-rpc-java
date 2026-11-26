@@ -10,15 +10,20 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import com.arpabet.valuerpc.ConformanceServer;
 import com.arpabet.valuerpc.GoServer;
+import com.arpabet.valuerpc.Pki;
+import com.arpabet.valuerpc.transport.TransportOptions;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -27,7 +32,8 @@ import org.junit.jupiter.api.Timeout;
  * The Go client against the server of this implementation: the reference as
  * the one that asks. The client is {@code conformance/client}, built and run
  * as a process; the server is {@link ConformanceServer}, the Java twin of the
- * Go conformance server. Over TCP, and over WebSocket in each of its codecs,
+ * Go conformance server, the functions that ask the client back among them.
+ * Over TCP, over TLS, and over WebSocket in each of its codecs,
  * which is the WebSocket client of the Go implementation against the
  * WebSocket listener of this one. Skipped where there is no Go toolchain.
  */
@@ -39,16 +45,27 @@ class GoClientInteropTest {
         List<String> flags(String address);
     }
 
-    private static final String[] TRANSPORTS = {"tcp", "ws msgpack", "ws json"};
+    private static final String[] TRANSPORTS = {"tcp", "tls", "ws msgpack", "ws json"};
+
+    /** The certificate of the server, and one for a client with its key, as files for the Go client. */
+    private static Path pem;
 
     private static String listen(String transport) {
-        return transport.equals("tcp") ? "tcp://127.0.0.1:0" : "ws://127.0.0.1:0/rpc";
+        return transport.equals("tcp") ? "tcp://127.0.0.1:0" : transport.equals("tls") ? "tls://127.0.0.1:0" : "ws://127.0.0.1:0/rpc";
+    }
+
+    /** A server to be on a transport: over TLS, with the certificate the Go client is told to trust. */
+    private static VrpcServer.Builder on(String transport) {
+        final VrpcServer.Builder builder = VrpcServer.builder().address(listen(transport));
+        return transport.equals("tls") ? builder.transportOptions(TransportOptions.DEFAULT.withTls(Pki.get().server())) : builder;
     }
 
     private static Reach reach(String transport) {
         switch (transport) {
             case "tcp":
                 return address -> Arrays.asList("-tcp", address);
+            case "tls":
+                return address -> Arrays.asList("-tls", address, "-ca", pem.resolve("server.pem").toString());
             case "ws json":
                 return address -> Arrays.asList("-ws", "ws://" + address, "-codec", "json");
             default:
@@ -60,6 +77,18 @@ class GoClientInteropTest {
     static void build() throws Exception {
         assumeTrue(GoServer.available(), "no Go toolchain: the Go client cannot be built");
         GoServer.build("client");
+        pem = Files.createTempDirectory("vrpc-go-client-pem");
+        Pki.get().writePem(pem);
+    }
+
+    @AfterAll
+    static void forget() throws IOException {
+        if (pem != null) {
+            for (String name : new String[] {"server.pem", "client.pem", "client-key.pem"}) {
+                Files.deleteIfExists(pem.resolve(name));
+            }
+            Files.deleteIfExists(pem);
+        }
     }
 
     /**
@@ -97,7 +126,7 @@ class GoClientInteropTest {
     @Test
     void aGoClientCallsTheServer() throws Exception {
         for (String transport : TRANSPORTS) {
-            try (ConformanceServer server = ConformanceServer.start(listen(transport), new ConformanceServer.Shared())) {
+            try (ConformanceServer server = ConformanceServer.start(on(transport), new ConformanceServer.Shared())) {
                 final List<String> flags = reach(transport).flags(server.address());
                 assertEquals("exit 0\nOK calls\nOK typed\nOK metadata\nOK whoami",
                         goClient(flags, "calls", "typed", "metadata", "whoami:"), "over " + transport);
@@ -110,7 +139,7 @@ class GoClientInteropTest {
     @Test
     void aGoClientStreamsBothWays() throws Exception {
         for (String transport : TRANSPORTS) {
-            try (ConformanceServer server = ConformanceServer.start(listen(transport), new ConformanceServer.Shared())) {
+            try (ConformanceServer server = ConformanceServer.start(on(transport), new ConformanceServer.Shared())) {
                 final List<String> flags = reach(transport).flags(server.address());
                 assertEquals("exit 0\nOK streams\nOK upload 5000\nOK chat\nOK chatend 6000\nOK calls",
                         goClient(flags, "streams", "upload:5000", "chat", "chatend:6000", "calls"), "over " + transport);
@@ -121,7 +150,7 @@ class GoClientInteropTest {
     @Test
     void theServerKeepsTheTimeAGoClientAllowsAndStopsWhatItGivesUp() throws Exception {
         for (String transport : TRANSPORTS) {
-            try (ConformanceServer server = ConformanceServer.start(listen(transport), new ConformanceServer.Shared())) {
+            try (ConformanceServer server = ConformanceServer.start(on(transport), new ConformanceServer.Shared())) {
                 final List<String> flags = reach(transport).flags(server.address());
                 assertEquals("exit 0\nOK deadline\nOK cancel\nOK calls", goClient(flags, "deadline", "cancel", "calls"),
                         "over " + transport);
@@ -130,9 +159,23 @@ class GoClientInteropTest {
     }
 
     @Test
+    void theServerAsksAGoClientBack() throws Exception {
+        for (String transport : TRANSPORTS) {
+            try (ConformanceServer server = ConformanceServer.start(on(transport), new ConformanceServer.Shared())) {
+                final List<String> flags = reach(transport).flags(server.address());
+                // A call, 6000 values from the client and three to it: what the Go client serves, asked by this server.
+                assertEquals("exit 0\nOK reverse\nOK calls", goClient(flags, "reverse", "calls"), "over " + transport);
+                // And of a client that was dropped and came back as the same session.
+                assertEquals("exit 0\nOK calls\nOK resume\nOK reverse\nOK calls",
+                        goClient(flags, "calls", "resume", "reverse", "calls"), "over " + transport);
+            }
+        }
+    }
+
+    @Test
     void aGoClientIsWhoItsCredentialSays() throws Exception {
         for (String transport : TRANSPORTS) {
-            try (ConformanceServer server = ConformanceServer.start(listen(transport), new ConformanceServer.Shared())) {
+            try (ConformanceServer server = ConformanceServer.start(on(transport), new ConformanceServer.Shared())) {
                 final List<String> flags = reach(transport).flags(server.address());
                 assertEquals("exit 0\nOK whoami tester", goClient(with(flags, "-credential", "secret"), "whoami:tester"),
                         "over " + transport);
@@ -145,10 +188,26 @@ class GoClientInteropTest {
     }
 
     @Test
+    void aGoClientIsLetInByTheCertificateItShows() throws Exception {
+        final VrpcServer.Builder builder = VrpcServer.builder().address("tls://127.0.0.1:0")
+                .transportOptions(TransportOptions.DEFAULT.withTls(Pki.get().server()).withClientAuth(true));
+        try (ConformanceServer server = ConformanceServer.start(builder, new ConformanceServer.Shared())) {
+            final List<String> flags = reach("tls").flags(server.address());
+            // With the certificate the server trusts, and the server says whose it was.
+            assertEquals("exit 0\nOK calls\nOK streams", goClient(with(flags, "-cert", pem.resolve("client.pem").toString(),
+                    "-key", pem.resolve("client-key.pem").toString()), "calls", "streams"));
+            assertEquals("vrpc-test-client", server.lastClientName());
+            // Without one it is not let in.
+            final String refused = goClient(with(flags, "-connect-timeout", "5000"), "calls");
+            assertEquals("exit 1", refused.substring(0, 6), refused);
+        }
+    }
+
+    @Test
     void aGoClientThatIsDroppedComesBackAsTheSameSession() throws Exception {
         for (String transport : TRANSPORTS) {
             final LinkedBlockingQueue<String> events = new LinkedBlockingQueue<String>();
-            final VrpcServer.Builder builder = VrpcServer.builder().address(listen(transport)).listener(new ServerListener() {
+            final VrpcServer.Builder builder = on(transport).listener(new ServerListener() {
                 @Override
                 public void onConnected(long clientId, String principal, String remoteAddress, boolean resumed) {
                     events.add(resumed ? "resumed" : "connected");

@@ -6,20 +6,26 @@
 package com.arpabet.valuerpc.client;
 
 import com.arpabet.value.MapValue;
-import com.arpabet.value.NullValue;
 import com.arpabet.value.NumberValue;
 import com.arpabet.value.Value;
 import com.arpabet.valuerpc.CallOptions;
 import com.arpabet.valuerpc.Chat;
+import com.arpabet.valuerpc.ChatHandler;
 import com.arpabet.valuerpc.ClientInterceptor;
 import com.arpabet.valuerpc.Code;
-import com.arpabet.valuerpc.CreditGate;
 import com.arpabet.valuerpc.Dialect;
 import com.arpabet.valuerpc.Frames;
+import com.arpabet.valuerpc.HandlerRegistry;
 import com.arpabet.valuerpc.HashChain;
+import com.arpabet.valuerpc.IncomingStreamHandler;
+import com.arpabet.valuerpc.Initiator;
 import com.arpabet.valuerpc.MessageType;
 import com.arpabet.valuerpc.Metrics;
-import com.arpabet.valuerpc.StreamBuffer;
+import com.arpabet.valuerpc.OutgoingStreamHandler;
+import com.arpabet.valuerpc.Peer;
+import com.arpabet.valuerpc.Responder;
+import com.arpabet.valuerpc.TypeDef;
+import com.arpabet.valuerpc.UnaryHandler;
 import com.arpabet.valuerpc.ValueSink;
 import com.arpabet.valuerpc.ValueStream;
 import com.arpabet.valuerpc.VrpcException;
@@ -31,13 +37,11 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -45,14 +49,14 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.Supplier;
 
 /**
  * The client. One connection carries every request: a thread of the transport
  * reads it and hands each message to {@link #dispatch}, which never waits,
- * and a thread of the client writes what the callers queue, several messages
- * at once when several wait. A request is a number and something that waits;
- * a message that carries the number is handed to what waits.
+ * and a thread of the client writes what is queued, several messages at once
+ * when several wait. What the client asks of the server is with its
+ * {@link Initiator}; what the server asks of the client, with the
+ * {@link Responder} of the connection it came on.
  */
 final class ClientImpl implements VrpcClient {
 
@@ -60,8 +64,6 @@ final class ClientImpl implements VrpcClient {
     private final Dialect dialect;
     private final long dialTimeoutMillis;
     private final int sendQueue;
-    private final int streamWindow;
-    private final Supplier<Map<String, String>> metadata;
     private final Metrics metrics;
     private final ClientListener listener;
     private final ClientInterceptor.Invoker invoker;
@@ -73,10 +75,12 @@ final class ClientImpl implements VrpcClient {
     private volatile long timeoutMillis;
     private volatile Value credential;
 
-    /** The requests that are not over, by their id. */
-    private final ConcurrentHashMap<Long, Pending> pending = new ConcurrentHashMap<Long, Pending>();
-    /** The ids a client gives its requests are 1, 2, 3 and so on; a server's are negative. */
-    private final AtomicLong lastRequest = new AtomicLong();
+    /** What the server may ask of this client, by name. A name registered again replaces: as in the Go client. */
+    private final HandlerRegistry registry = new HandlerRegistry(true);
+    /** What this client asks of the server. */
+    private final Initiator initiator;
+    /** How what the server asks is served, on whichever connection it comes. */
+    private final Responder.Setup serving;
     private final AtomicLong reconnects = new AtomicLong();
 
     private final ReentrantLock connectLock = new ReentrantLock();
@@ -96,17 +100,48 @@ final class ClientImpl implements VrpcClient {
         this.dialect = b.dialect;
         this.dialTimeoutMillis = b.dialTimeoutMillis;
         this.sendQueue = b.sendQueue;
-        this.streamWindow = b.streamWindow;
-        this.metadata = b.metadata;
         this.metrics = b.metrics;
         this.listener = b.listener;
         this.timeoutMillis = b.timeoutMillis;
         this.credential = b.credential;
         this.intercepted = !b.interceptors.isEmpty();
-        this.invoker = ClientInterceptor.chain(this::invokeUnary, new ArrayList<ClientInterceptor>(b.interceptors));
         this.timer = new ScheduledThreadPoolExecutor(1, r -> daemon("vrpc-client-timer", r));
         this.timer.setRemoveOnCancelPolicy(true);
+        this.initiator = new Initiator(new Initiator.Setup(true, dialect, metrics, timer, b.streamWindow,
+                () -> timeoutMillis, b.metadata, 0), new Initiator.Host() {
+                    @Override
+                    public Initiator.Link connected() {
+                        return ClientImpl.this.connected();
+                    }
+
+                    @Override
+                    public VrpcException closed() {
+                        return closed ? clientClosed() : null;
+                    }
+
+                    @Override
+                    public void protocolError(MapValue message, String problem) {
+                        listener.onProtocolError(message, problem);
+                    }
+                });
+        this.invoker = ClientInterceptor.chain(initiator::callFunction, new ArrayList<ClientInterceptor>(b.interceptors));
+        // A client limits the calls it serves at once, and no streams: as the Go client.
+        this.serving = new Responder.Setup(false, dialect, registry, metrics, timer, this::runHandler,
+                b.maxConcurrentInbound, 0, b.streamWindow, null);
     }
+
+    /** What goes wrong while the server is served goes to the listener of the client. */
+    private final Responder.Events servingEvents = new Responder.Events() {
+        @Override
+        public void protocolError(MapValue message, String problem) {
+            listener.onProtocolError(message, problem);
+        }
+
+        @Override
+        public void handlerFailure(String where, Throwable error) {
+            listener.onHandlerFailure(where, error);
+        }
+    };
 
     private static Thread daemon(String name, Runnable task) {
         final Thread t = new Thread(task, name);
@@ -126,6 +161,14 @@ final class ClientImpl implements VrpcClient {
             }
         }
         return e;
+    }
+
+    /** Hands a handler to a thread of the client, which has them only once the server asks something. */
+    private void runHandler(Runnable task) {
+        if (closed) {
+            throw new RejectedExecutionException("client closed");
+        }
+        executor().execute(task);
     }
 
     // --- what it is ----------------------------------------------------------------
@@ -154,9 +197,9 @@ final class ClientImpl implements VrpcClient {
     @Override
     public Map<String, Long> stats() {
         final Map<String, Long> out = new LinkedHashMap<String, Long>();
-        out.put("requests", lastRequest.get());
+        out.put("requests", initiator.requests());
         out.put("reconnects", reconnects.get());
-        out.put("pending", (long) pending.size());
+        out.put("pending", (long) initiator.pending());
         final Connection c = connection.get();
         out.put("sendingLen", c == null ? 0L : (long) c.outbox.size());
         out.put("sendingCap", (long) sendQueue);
@@ -259,9 +302,10 @@ final class ClientImpl implements VrpcClient {
     }
 
     /**
-     * A connection was lost. What waited on it cannot be answered any more
-     * and fails at once, rather than each call waiting out its timeout; then
-     * the client connects again, so that the server can reach it.
+     * A connection was lost. What was asked on it cannot be answered any more
+     * and fails at once, rather than each call waiting out its timeout, and
+     * what the server asked on it is given up, as the server has given it up;
+     * then the client connects again, so that the server can reach it.
      */
     private void connectionLost(Connection c, Throwable cause) {
         if (closed || !connection.compareAndSet(c, null)) {
@@ -271,23 +315,13 @@ final class ClientImpl implements VrpcClient {
         reconnects.incrementAndGet();
         metrics.reconnect();
         // Requests made from here on belong to the next connection.
-        failAll(lastRequest.get(), LOST);
+        initiator.failOn(c, null);
+        c.responder.lost("connection lost");
         listener.onDisconnected(cause);
         try {
             connect();
         } catch (VrpcException e) {
             // The next call connects.
-        }
-    }
-
-    /** What a request is told that was on a connection when it was lost, as the Go client words it. */
-    private static final String LOST = "connection lost during reconnect";
-
-    private void failAll(long upTo, String why) {
-        for (Pending p : pending.values()) {
-            if (p.id <= upTo) {
-                fail(p, new VrpcException(Code.UNAVAILABLE, why));
-            }
         }
     }
 
@@ -297,8 +331,9 @@ final class ClientImpl implements VrpcClient {
         final Connection c = connection.getAndSet(null);
         if (c != null) {
             c.close();
+            c.responder.lost("client closed");
         }
-        failAll(Long.MAX_VALUE, "client closed");
+        initiator.failAll(clientClosed());
         timer.shutdownNow();
         final ExecutorService e = executor;
         if (e != null) {
@@ -306,196 +341,7 @@ final class ClientImpl implements VrpcClient {
         }
     }
 
-    // --- requests ------------------------------------------------------------------
-
-    /** A request that is not over: a call that waits for its answer, or a stream. */
-    private abstract class Pending {
-        final long id;
-        final String name;
-        final long startNanos = System.nanoTime();
-        volatile ScheduledFuture<?> timeout;
-        /**
-         * Why the request failed; null while it is not over, and when it
-         * ended well. Written under the monitor of the request, in the step
-         * that takes it out of the pending ones ({@code retireFailed}).
-         */
-        volatile VrpcException error;
-
-        Pending(long id, String name) {
-            this.id = id;
-            this.name = name;
-        }
-
-        /** A message of the peer for this request. On the thread that reads the connection: it must not wait. */
-        abstract void onMessage(MessageType type, MapValue message);
-
-        /** The request failed; it has been retired already. */
-        abstract void failed(VrpcException error);
-
-        /** Whether the peer has taken the request, after which its timeout no longer applies. */
-        boolean taken() {
-            return false;
-        }
-    }
-
-    private long timeoutOf(CallOptions options) {
-        final long t = options.timeoutMillis() != 0 ? options.timeoutMillis() : timeoutMillis;
-        return t < 0 ? 0 : t;
-    }
-
-    private Map<String, String> metadataOf(CallOptions options) {
-        Map<String, String> md = null;
-        if (metadata != null) {
-            final Map<String, String> every = metadata.get();
-            if (every != null && !every.isEmpty()) {
-                md = new LinkedHashMap<String, String>(every);
-            }
-        }
-        if (!options.metadata().isEmpty()) {
-            if (md == null) {
-                return options.metadata();
-            }
-            md.putAll(options.metadata());
-        }
-        return md;
-    }
-
-    /** Registers a request and sends what opens it. */
-    private void open(Pending p, MessageType type, Value args, CallOptions options) {
-        final Connection c = connected();
-        final long timeout = timeoutOf(options);
-        // A client always sends the arguments, null when there are none.
-        final MapValue request = dialect.request(type, p.id, p.name, args == null ? NullValue.NULL : args, timeout,
-                metadataOf(options));
-        pending.put(p.id, p);
-        metrics.requestBegin(p.name);
-        if (timeout > 0) {
-            try {
-                p.timeout = timer.schedule(() -> timedOut(p), timeout, TimeUnit.MILLISECONDS);
-            } catch (RejectedExecutionException e) {
-                fail(p, clientClosed());
-                return;
-            }
-        }
-        if (!c.send(request)) {
-            fail(p, closed ? clientClosed() : new VrpcException(Code.UNAVAILABLE, "connection lost"));
-        }
-    }
-
-    /**
-     * Takes a request out of the ones that are not over. Whoever takes it out
-     * is the one to say how it ended: every way a request can end comes here,
-     * and only the first gets true.
-     */
-    private boolean retire(Pending p, Code code) {
-        if (!pending.remove(p.id, p)) {
-            return false;
-        }
-        retired(p, code);
-        return true;
-    }
-
-    /**
-     * Retires a request that failed, and leaves with it why. For whoever
-     * looks at the request under its monitor the two are one step: a stream
-     * that finds itself taken out of the pending ones can say why
-     * ({@code StreamCall.gone}), also when the one that failed it has not yet
-     * come to tell it ({@code Pending.failed}). Without that, an application
-     * that sent on a stream between the two was told the stream is closed,
-     * where its connection had been lost.
-     */
-    private boolean retireFailed(Pending p, VrpcException error) {
-        synchronized (p) {
-            if (!pending.remove(p.id, p)) {
-                return false;
-            }
-            p.error = error;
-        }
-        retired(p, error.code());
-        return true;
-    }
-
-    /** What follows taking a request out, of whichever kind. Not under its monitor: the metrics are the application's. */
-    private void retired(Pending p, Code code) {
-        final ScheduledFuture<?> t = p.timeout;
-        if (t != null) {
-            t.cancel(false);
-        }
-        metrics.requestEnd(p.name, code, System.nanoTime() - p.startNanos);
-    }
-
-    private void fail(Pending p, VrpcException error) {
-        if (retireFailed(p, error)) {
-            p.failed(error);
-        }
-    }
-
-    /** The caller gave up: the peer is told, and the request is retired here, since a cancel is not answered. */
-    private void cancel(Pending p) {
-        if (pending.get(p.id) != p) {
-            return; // over already: closing a stream that has ended comes here
-        }
-        final VrpcException canceled = new VrpcException(Code.CANCELED, "request " + p.id + " canceled");
-        if (retireFailed(p, canceled)) {
-            tellCancel(p.id);
-            p.failed(canceled);
-        }
-    }
-
-    private void timedOut(Pending p) {
-        if (p.taken() || pending.get(p.id) != p) {
-            return;
-        }
-        final VrpcException timeout = new VrpcException(Code.DEADLINE_EXCEEDED, "timeout");
-        if (retireFailed(p, timeout)) {
-            tellCancel(p.id);
-            p.failed(timeout);
-        }
-    }
-
-    private void tellCancel(long id) {
-        final Connection c = connection.get();
-        if (c != null) {
-            c.trySend(dialect.cancelRequest(Value.ofLong(id)));
-        }
-    }
-
-    private static VrpcException thrown(ExecutionException e) {
-        final Throwable cause = e.getCause();
-        return cause instanceof VrpcException ? (VrpcException) cause
-                : new VrpcException(Code.UNKNOWN, String.valueOf(cause), cause);
-    }
-
-    // --- calls ---------------------------------------------------------------------
-
-    private final class PendingCall extends Pending {
-        final CompletableFuture<Value> future = new CompletableFuture<Value>();
-
-        PendingCall(long id, String name) {
-            super(id, name);
-        }
-
-        @Override
-        void onMessage(MessageType type, MapValue message) {
-            if (type == MessageType.FUNCTION_RESPONSE) {
-                if (retire(this, Code.OK)) {
-                    future.complete(dialect.result(message));
-                }
-            } else if (type == MessageType.ERROR_RESPONSE) {
-                fail(this, dialect.errorOf(message));
-            } else if (type == MessageType.CANCEL_REQUEST) {
-                fail(this, new VrpcException(Code.CANCELED, "request " + id + " canceled by peer"));
-            } else {
-                // A message of a stream for a call: not delivered.
-                listener.onProtocolError(message, "message type not supported");
-            }
-        }
-
-        @Override
-        void failed(VrpcException error) {
-            future.completeExceptionally(error);
-        }
-    }
+    // --- what it asks ---------------------------------------------------------------
 
     @Override
     public Value callFunction(String name, Value args, CallOptions options) {
@@ -505,369 +351,74 @@ final class ClientImpl implements VrpcClient {
     @Override
     public CompletableFuture<Value> callFunctionAsync(String name, Value args, CallOptions options) {
         final CallOptions o = options == null ? CallOptions.DEFAULT : options;
-        if (intercepted) {
-            // Interceptors are written to wait for the call: they run on a
-            // thread of the client. Cancelling the future interrupts it, which
-            // cancels the call that is under way, and has an interceptor that
-            // waits, between the attempts of a retry say, stop waiting.
-            final CompletableFuture<Value> future = new CompletableFuture<Value>();
-            if (closed) {
-                future.completeExceptionally(clientClosed());
-                return future;
-            }
-            final Future<?> chain;
-            try {
-                chain = executor().submit(() -> {
-                    try {
-                        future.complete(invoker.invoke(name, args, o));
-                    } catch (Throwable t) {
-                        future.completeExceptionally(t);
-                    }
-                });
-            } catch (RejectedExecutionException e) {
-                future.completeExceptionally(clientClosed());
-                return future;
-            }
-            future.whenComplete((value, error) -> {
-                if (future.isCancelled()) {
-                    chain.cancel(true);
-                }
-            });
+        if (!intercepted) {
+            return initiator.callFunctionAsync(name, args, o);
+        }
+        // Interceptors are written to wait for the call: they run on a
+        // thread of the client. Cancelling the future interrupts it, which
+        // cancels the call that is under way, and has an interceptor that
+        // waits, between the attempts of a retry say, stop waiting.
+        final CompletableFuture<Value> future = new CompletableFuture<Value>();
+        if (closed) {
+            future.completeExceptionally(clientClosed());
             return future;
         }
-        final PendingCall p = new PendingCall(lastRequest.incrementAndGet(), name);
+        final Future<?> chain;
         try {
-            open(p, MessageType.FUNCTION_REQUEST, args, o);
-        } catch (VrpcException e) {
-            p.future.completeExceptionally(e);
-            return p.future;
+            chain = executor().submit(() -> {
+                try {
+                    future.complete(invoker.invoke(name, args, o));
+                } catch (Throwable t) {
+                    future.completeExceptionally(t);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            future.completeExceptionally(clientClosed());
+            return future;
         }
-        p.future.whenComplete((value, error) -> {
-            if (p.future.isCancelled()) {
-                cancel(p);
+        future.whenComplete((value, error) -> {
+            if (future.isCancelled()) {
+                chain.cancel(true);
             }
         });
-        return p.future;
-    }
-
-    /** The call itself: the innermost step of the interceptors. */
-    private Value invokeUnary(String name, Value args, CallOptions options) {
-        final PendingCall p = new PendingCall(lastRequest.incrementAndGet(), name);
-        open(p, MessageType.FUNCTION_REQUEST, args, options);
-        try {
-            return p.future.get();
-        } catch (InterruptedException e) {
-            cancel(p);
-            Thread.currentThread().interrupt();
-            throw new VrpcException(Code.CANCELED, "the call was interrupted", e);
-        } catch (ExecutionException e) {
-            throw thrown(e);
-        }
-    }
-
-    // --- streams -------------------------------------------------------------------
-
-    /**
-     * A stream this client opened: what the server sends is buffered for the
-     * application, which is granted to the server as credit; what the
-     * application sends waits at a gate for the credit the server grants.
-     */
-    private final class StreamCall extends Pending {
-        final MessageType kind;
-        /** Completes when the server has taken the request; fails when the stream fails first. */
-        final CompletableFuture<Void> ready = new CompletableFuture<Void>();
-        /** What the server sends; null when it sends nothing. */
-        final StreamBuffer in;
-        /** The credit to send with; null when this side sends nothing. */
-        final CreditGate out;
-        /** This side has ended what it sends. */
-        private volatile boolean outEnded;
-        /** Values taken since credit was last granted. Only the thread that reads the stream touches it. */
-        private long takenSinceGrant;
-
-        StreamCall(long id, String name, MessageType kind) {
-            super(id, name);
-            this.kind = kind;
-            this.in = kind == MessageType.PUT_STREAM_REQUEST ? null : new StreamBuffer(streamWindow, this::taken1);
-            this.out = kind == MessageType.GET_STREAM_REQUEST ? null : new CreditGate();
-        }
-
-        @Override
-        boolean taken() {
-            return ready.isDone();
-        }
-
-        @Override
-        void onMessage(MessageType type, MapValue message) {
-            switch (type) {
-                case STREAM_READY:
-                    ready.complete(null);
-                    break;
-                case STREAM_VALUE: {
-                    final Value v = dialect.streamValueOf(message);
-                    if (in == null) {
-                        listener.onProtocolError(message, "message type not supported");
-                    } else if (v != null) {
-                        if (in.offer(v)) {
-                            metrics.streamValue(name);
-                        } else if (in.overflowed()) {
-                            // The server sent more than it had credit for:
-                            // the stream is cut short, and says so.
-                            final VrpcException truncated = new VrpcException(Code.RESOURCE_EXHAUSTED,
-                                    "stream " + id + " truncated: server exceeded flow-control credit");
-                            if (retireFailed(this, truncated)) {
-                                tellCancel(id);
-                                failed(truncated);
-                            }
-                        }
-                    }
-                    break;
-                }
-                case STREAM_END: {
-                    // The server ending what it sends ends the stream, of
-                    // whatever kind; an end may carry a last value.
-                    if (in != null) {
-                        final Value last = dialect.streamValueOf(message);
-                        if (last != null && in.offer(last)) {
-                            metrics.streamValue(name);
-                        }
-                    }
-                    if (retire(this, Code.OK)) {
-                        ready.complete(null);
-                        if (in != null) {
-                            in.end();
-                        }
-                        if (out != null) {
-                            out.close();
-                        }
-                    }
-                    break;
-                }
-                case STREAM_CREDIT: {
-                    final NumberValue credit = dialect.credit(message);
-                    if (out != null && credit != null) {
-                        out.grant(credit.longValue());
-                    }
-                    break;
-                }
-                case ERROR_RESPONSE:
-                    fail(this, dialect.errorOf(message));
-                    break;
-                case CANCEL_REQUEST:
-                    fail(this, new VrpcException(Code.CANCELED, "request " + id + " canceled by peer"));
-                    break;
-                default:
-                    listener.onProtocolError(message, "message type not supported");
-            }
-        }
-
-        @Override
-        void failed(VrpcException e) {
-            // Why is with the stream already (retireFailed): what follows
-            // lets go of whoever waits on it, and they ask.
-            ready.completeExceptionally(e);
-            if (in != null) {
-                in.stop();
-            }
-            if (out != null) {
-                out.close();
-            }
-        }
-
-        /** The application took a value: the server may send another, told in batches of half the window. */
-        private void taken1() {
-            takenSinceGrant++;
-            if (takenSinceGrant >= Math.max(1, streamWindow / 2)) {
-                final long n = takenSinceGrant;
-                takenSinceGrant = 0;
-                grant(n);
-            }
-        }
-
-        void grant(long n) {
-            final Connection c = connection.get();
-            if (c != null && pending.get(id) == this) {
-                c.send(dialect.streamCredit(Value.ofLong(id), n));
-            }
-        }
-
-        /** Why this stream takes no more: what failed it, or else that it is over. */
-        private VrpcException gone() {
-            final VrpcException e;
-            // Under the monitor a failed stream is retired under: one that is
-            // being failed as this asks has been given its reason by the time
-            // this is let in.
-            synchronized (this) {
-                e = error;
-            }
-            return e != null ? e : new VrpcException(Code.CANCELED, "stream " + id + " is closed");
-        }
-
-        Value take(long nanos) throws InterruptedException, TimeoutException {
-            final Value v = in.take(nanos);
-            if (v == null) {
-                final VrpcException e = error;
-                if (e != null) {
-                    throw e;
-                }
-            }
-            return v;
-        }
-
-        void send(Value value) throws InterruptedException {
-            if (value == null || value.isNull()) {
-                throw new IllegalArgumentException("a stream does not carry null");
-            }
-            if (outEnded) {
-                throw gone();
-            }
-            // Wait for the server to have room: only this thread waits.
-            if (!out.acquire()) {
-                throw gone();
-            }
-            if (pending.get(id) != this) {
-                throw gone();
-            }
-            final Connection c = connection.get();
-            if (c == null || !c.send(dialect.streamValue(Value.ofLong(id), value))) {
-                if (c == null || !c.isOpen()) {
-                    // There is no connection to send on: it is lost, or the
-                    // client is closed, and this stream with it. What deals
-                    // with that may not have come to this stream yet, so it
-                    // is said here: the reason is the same whoever says it.
-                    fail(this, closed ? clientClosed() : new VrpcException(Code.UNAVAILABLE, LOST));
-                }
-                throw gone();
-            }
-            metrics.streamValue(name);
-        }
-
-        /** This side has no more to send. For a stream to the server that is its end; a chat goes on. */
-        void endOut() {
-            if (outEnded) {
-                return;
-            }
-            outEnded = true;
-            if (pending.get(id) != this) {
-                return;
-            }
-            final Connection c = connection.get();
-            if (c != null) {
-                c.send(dialect.streamEnd(Value.ofLong(id), null));
-            }
-            if (kind == MessageType.PUT_STREAM_REQUEST && retire(this, Code.OK)) {
-                out.close();
-            }
-        }
-
-        final ValueStream incoming = new ValueStream() {
-            @Override
-            public Value take() throws InterruptedException {
-                try {
-                    return StreamCall.this.take(0);
-                } catch (TimeoutException e) {
-                    throw new AssertionError(e);
-                }
-            }
-
-            @Override
-            public Value take(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException {
-                return StreamCall.this.take(Math.max(1, unit.toNanos(timeout)));
-            }
-
-            @Override
-            public long requestId() {
-                return id;
-            }
-
-            @Override
-            public void close() {
-                cancel(StreamCall.this);
-            }
-        };
-
-        final ValueSink outgoing = new ValueSink() {
-            @Override
-            public void send(Value value) throws InterruptedException {
-                StreamCall.this.send(value);
-            }
-
-            @Override
-            public long requestId() {
-                return id;
-            }
-
-            @Override
-            public void close() {
-                endOut();
-            }
-
-            @Override
-            public void cancel() {
-                ClientImpl.this.cancel(StreamCall.this);
-            }
-        };
-    }
-
-    /** Opens a stream and waits until the server has taken it. */
-    private StreamCall openStream(MessageType kind, String name, Value args, CallOptions options) {
-        final StreamCall s = new StreamCall(lastRequest.incrementAndGet(), name, kind);
-        open(s, kind, args, options == null ? CallOptions.DEFAULT : options);
-        try {
-            s.ready.get();
-        } catch (InterruptedException e) {
-            cancel(s);
-            Thread.currentThread().interrupt();
-            throw new VrpcException(Code.CANCELED, "interrupted while opening a stream", e);
-        } catch (ExecutionException e) {
-            throw thrown(e);
-        }
-        // The timeout bounded the opening; the stream itself lasts until it ends.
-        final ScheduledFuture<?> t = s.timeout;
-        if (t != null) {
-            t.cancel(false);
-        }
-        if (s.in != null) {
-            // The server sends only what it has credit for: grant it the window.
-            s.grant(streamWindow);
-        }
-        return s;
+        return future;
     }
 
     @Override
     public ValueStream getStream(String name, Value args, CallOptions options) {
-        return openStream(MessageType.GET_STREAM_REQUEST, name, args, options).incoming;
+        return initiator.getStream(name, args, options);
     }
 
     @Override
     public ValueSink putStream(String name, Value args, CallOptions options) {
-        return openStream(MessageType.PUT_STREAM_REQUEST, name, args, options).outgoing;
+        return initiator.putStream(name, args, options);
     }
 
     @Override
     public Chat chat(String name, Value args, CallOptions options) {
-        final StreamCall s = openStream(MessageType.CHAT_REQUEST, name, args, options);
-        return new Chat() {
-            @Override
-            public ValueStream incoming() {
-                return s.incoming;
-            }
+        return initiator.chat(name, args, options);
+    }
 
-            @Override
-            public ValueSink outgoing() {
-                return s.outgoing;
-            }
+    // --- what it serves --------------------------------------------------------------
 
-            @Override
-            public long requestId() {
-                return s.id;
-            }
+    @Override
+    public void addFunction(String name, TypeDef args, TypeDef result, UnaryHandler handler) {
+        registry.addFunction(name, args, result, handler);
+    }
 
-            @Override
-            public void close() {
-                cancel(s);
-            }
-        };
+    @Override
+    public void addOutgoingStream(String name, TypeDef args, OutgoingStreamHandler handler) {
+        registry.addOutgoingStream(name, args, handler);
+    }
+
+    @Override
+    public void addIncomingStream(String name, TypeDef args, IncomingStreamHandler handler) {
+        registry.addIncomingStream(name, args, handler);
+    }
+
+    @Override
+    public void addChat(String name, TypeDef args, ChatHandler handler) {
+        registry.addChat(name, args, handler);
     }
 
     // --- what the server sends -----------------------------------------------------
@@ -885,16 +436,22 @@ final class ClientImpl implements VrpcClient {
             c.handshake.complete(message);
             return;
         }
-        if (type != null && type.opensRequest()) {
-            serve(c, message);
-            return;
-        }
         final NumberValue idValue = dialect.requestId(message);
         if (idValue == null) {
             listener.onProtocolError(message, "request id not found");
             return;
         }
         final long id = idValue.longValue();
+        if (type != null && type.opensRequest()) {
+            // The server asks something of this client.
+            if (id >= 0) {
+                // A request of the server has a negative id; any other would be taken for an answer.
+                listener.onProtocolError(message, "server-initiated request must use a negative request id");
+                return;
+            }
+            c.responder.onMessage(type, idValue, message);
+            return;
+        }
         if (type == MessageType.ERROR_RESPONSE && id == dialect.handshakeRequestId() && !c.handshake.isDone()) {
             // The server refuses the handshake, and says why before it closes.
             final VrpcException refused = dialect.errorOf(message);
@@ -902,46 +459,21 @@ final class ClientImpl implements VrpcClient {
                     VrpcException.ofNumber(refused.codeNumber(), "handshake: " + refused.detail()));
             return;
         }
-        final Pending p = pending.get(id);
-        if (p == null) {
-            listener.onProtocolError(message, "request not found");
+        if (id < 0) {
+            // About a request the server opened here.
+            c.responder.onMessage(type, idValue, message);
             return;
         }
-        if (type == null) {
-            listener.onProtocolError(message, "message type not supported");
-            return;
-        }
-        p.onMessage(type, message);
-    }
-
-    /**
-     * A request the server opened on this client. Nothing is registered to
-     * serve one yet, so it is answered as a function that is not there.
-     */
-    private void serve(Connection c, MapValue request) {
-        final NumberValue id = dialect.requestId(request);
-        if (id == null) {
-            listener.onProtocolError(request, "request id not found");
-            return;
-        }
-        if (id.longValue() >= 0) {
-            // A request of the server has a negative id; any other would be taken for an answer.
-            listener.onProtocolError(request, "server-initiated request must use a negative request id");
-            return;
-        }
-        final String name = dialect.functionName(request);
-        if (name == null) {
-            c.trySend(dialect.error(id, Code.INVALID_ARGUMENT, "function name field not found"));
-            return;
-        }
-        c.trySend(dialect.error(id, Code.NOT_FOUND, "function not found " + name));
+        initiator.onMessage(type, id, message);
     }
 
     // --- the connection ------------------------------------------------------------
 
-    private final class Connection implements MsgConn.Receiver {
+    private final class Connection implements MsgConn.Receiver, Initiator.Link, Responder.Link {
         final MsgConn conn;
         final ArrayBlockingQueue<MapValue> outbox = new ArrayBlockingQueue<MapValue>(sendQueue);
+        /** What the server asks on this connection. */
+        final Responder responder = new Responder(serving, this, servingEvents);
         /** Completes with the server's answer to the handshake, or with why there is none. */
         final CompletableFuture<MapValue> handshake = new CompletableFuture<MapValue>();
         /** Closed by this client, on purpose. */
@@ -961,12 +493,30 @@ final class ClientImpl implements VrpcClient {
             t.start();
         }
 
-        boolean isOpen() {
+        @Override
+        public boolean isOpen() {
             return !closedHere && !gone;
         }
 
+        @Override
+        public String remoteAddress() {
+            return conn.remoteAddress();
+        }
+
+        /** A client does not authenticate its server by a handshake: nobody is named. */
+        @Override
+        public String principal() {
+            return "";
+        }
+
+        @Override
+        public Peer peer() {
+            return ClientImpl.this;
+        }
+
         /** Queues a message, waiting while the queue is full. False when the connection is gone. */
-        boolean send(MapValue message) {
+        @Override
+        public boolean send(MapValue message) {
             try {
                 while (isOpen()) {
                     if (outbox.offer(message, 100, TimeUnit.MILLISECONDS)) {
@@ -980,7 +530,8 @@ final class ClientImpl implements VrpcClient {
         }
 
         /** Queues a message if there is room at once: for what may be dropped. */
-        boolean trySend(MapValue message) {
+        @Override
+        public boolean trySend(MapValue message) {
             return isOpen() && outbox.offer(message);
         }
 

@@ -7,9 +7,11 @@ in one version.
 
 ## Unreleased
 
-The server, ahead of its place in the plan, and a WebSocket listener for it,
-so that a browser reaches a Java server: the client there is `@arpabet/vrpc`
-(value-rpc-js). The version between releases is 0.2.0-SNAPSHOT.
+The server, ahead of its place in the plan, and what makes a connection of it
+complete: a WebSocket listener, so that a browser reaches a Java server (the
+client there is `@arpabet/vrpc`, value-rpc-js); requests in both directions,
+so that a server asks its clients; a WebSocket client; and TLS under both.
+The version between releases is 0.2.0-SNAPSHOT.
 
 ### Added
 
@@ -43,26 +45,74 @@ so that a browser reaches a Java server: the client there is `@arpabet/vrpc`
   binary frames and JSON in text frames, agreed on by subprotocol as the Go
   listener agrees on them; the origins a browser may connect from; a ping for
   a silent connection; the closing handshake. No TLS and no compression.
+- **Both directions.** A connection carries requests either way, by every
+  pattern, over every transport, QUIC among them.
+  - `VrpcClient` is a `Registrar`: `addFunction`, `addOutgoingStream`,
+    `addIncomingStream` and `addChat` register what its server may ask of it,
+    with the handlers and the `RequestContext` of a server. It answers in the
+    words of the Go client, replaces a name that is registered again, and
+    serves 1024 calls at once (`maxConcurrentInbound`); a request of a server
+    that is not numbered below zero is taken for nothing.
+    `ClientListener.onHandlerFailure` is told what a handler threw.
+  - `RequestContext.peer()`: the one who asks, as a `Peer` to ask in turn. On
+    a server it is the client whose request this is, across the connections
+    of that client, so it may be kept and asked later. Requests of a server
+    are numbered -1, -2, -3; they leave out arguments there are none of, name
+    no time, and carry metadata with a call only, as those of the Go server.
+  - What a server asked fails with `UNAVAILABLE` when the connection it went
+    out on is lost, or its client comes back on another (in the words of the
+    Go server); what a client served on a connection it lost is cancelled,
+    and its handler interrupted.
+- **A WebSocket client**, in the core, on plain sockets, so that it runs on
+  Android: `ws://host:port/path` as the address of a client, or
+  `Transports.webSocketDialer` with `WebSocketOptions` for JSON. It offers its
+  codec as a subprotocol and connects only to a server that takes it.
+- **TLS**: `tls://`, the frames of TCP over a TLS socket, and `wss://`, to
+  dial and to listen on. `TransportOptions.withTls(SSLContext)` gives the
+  keys and the trust, and `withClientAuth(true)` has a listener ask every
+  client for a certificate. A dialer checks the certificate against the host
+  of the address. `MsgConn.tlsSession()` has what the peer showed.
 - `conformance/client`, the Go client as a program, also over TCP with every
-  scenario and over WebSocket (`-ws`, `-codec`), with scenarios for streams,
-  metadata, the credential, deadlines, cancellation and resumption.
+  scenario, over TLS (`-tls`) and over WebSocket (`-ws`, `-codec`), with
+  scenarios for streams, metadata, the credential, deadlines, cancellation,
+  resumption, and for being asked back by the server (`reverse`).
+  `conformance/server` listens on WebSocket over TLS as well.
 - `ConformanceServer`, the Java twin of the Go conformance server, as a test
   fixture and as a program: `./gradlew :value-rpc:conformanceServer`.
 
+### Changed
+
+- The two halves of a connection are one engine for both ends, as the plan
+  had it: `Initiator`, which asks, `Responder`, which answers, and
+  `HandlerRegistry`, in the core package. The client and the server differ
+  in what is theirs: dialing and reconnecting on one side, accepting and
+  sessions on the other.
+- A request belongs to the connection it went out on, and fails when that one
+  is lost; before, a client failed every request made up to the moment it
+  noticed.
+
+### Fixed
+
+- A handler whose stream was cancelled by its peer could find the stream over
+  before its request said it was cancelled (`RequestContext.isCancelled()`).
+  The two are one step now.
+
 ### Not yet
 
-- A server that calls its clients, and a client that serves such calls.
-- A WebSocket client; `wss://`; a WebSocket listener on Netty.
+- Replay of calls after a reconnect; `unix://`; a WebSocket listener on Netty.
 
 ### Compatibility
 
 - Checked at every build, where there is a Go toolchain: the Go client
-  against this server over TCP and over WebSocket in both codecs, with calls,
-  the three kinds of stream, deadlines, cancellation, the credential, and a
-  dropped connection that is resumed.
-- Checked by hand against the conformance suite of value-rpc-js 0.4.0: 15 of
-  its 19 scenarios pass in each codec, and the 4 that do not are the ones in
-  which the server calls its client.
+  against this server over TCP, over TLS (also with a certificate of the
+  client), over WebSocket in both codecs and over QUIC, with calls, the three
+  kinds of stream, deadlines, cancellation, the credential, a dropped
+  connection that is resumed, and the server asking the client back; and
+  this client against the Go server over TCP, TLS, WebSocket in both codecs,
+  WebSocket over TLS and QUIC, the Go server asking it back among it.
+- Checked by hand against the conformance suite of value-rpc-js: all of its
+  19 scenarios pass in each codec, the four in which the server calls its
+  client among them (`VRPC_CONFORMANCE_SERVER`, in the README).
 - Where the server differs from the Go one, a client does not have to know:
   [MIGRATION_PLAN.md](MIGRATION_PLAN.md) lists it under Progress.
 

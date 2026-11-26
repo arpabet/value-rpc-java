@@ -45,6 +45,20 @@ public interface RequestContext {
     String remoteAddress();
 
     /**
+     * The one who asks, as something to ask in turn: a connection is used in
+     * both directions. On a server it is the client whose request this is,
+     * for what that client registered; on a client, the server. It is the Go
+     * implementation's {@code PeerFromContext}.
+     *
+     * <p>On a server the peer is the client across its connections: it may
+     * be kept, by who the client is say, and asked later, from another
+     * request. What is asked while the client is not connected fails with
+     * {@link Code#UNAVAILABLE}, and so does what was under way when its
+     * connection was lost.
+     */
+    Peer peer();
+
+    /**
      * How long the caller still waits for this call, in milliseconds: what is
      * left of the time it allowed when it made the call. 0 once that time has
      * passed, and -1 when the caller named no time. Only a call has one; a

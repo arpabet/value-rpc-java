@@ -21,6 +21,7 @@ import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -32,20 +33,24 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.SSLSocket;
 
 /**
- * WebSocket, the side that listens: what a browser, or any client that has a
- * WebSocket and no socket, connects to. A message travels as one WebSocket
+ * WebSocket, both sides: what a browser, or any client that has a WebSocket
+ * and no socket, connects to, and the client that connects to a server which
+ * is reached through an HTTP port. A message travels as one WebSocket
  * message, with no length before it: MessagePack in a binary frame or JSON in
  * a text one, as the two ends agree by subprotocol when the connection opens
  * (see {@link WireCodec}). It is the Go implementation's
- * {@code NewWebSocketListener}.
+ * {@code NewWebSocketListener} and {@code NewWebSocketDialer}.
  *
  * <p>This is the protocol of RFC 6455 on a socket, with a thread for each
- * connection, as the TCP listener has: the request that asks to be upgraded,
- * frames and their masks, messages in several frames, ping and pong, and the
- * close. It takes no extension, so nothing is compressed, and it does not
- * serve TLS.
+ * connection, as the TCP transport has: the request that asks to be upgraded
+ * and its answer, frames and their masks, messages in several frames, ping
+ * and pong, and the close. It takes no extension, so nothing is compressed.
+ * Under {@code wss://} the socket is a TLS one ({@link Tls}). It uses nothing
+ * but sockets, so it runs on Android as it does on a JVM.
  */
 final class Ws {
 
@@ -79,8 +84,18 @@ final class Ws {
     private Ws() {
     }
 
-    /** A listener on {@code host:port/path}; the path is {@code /} when there is none. */
-    static Listener listen(String hostPortPath, TransportOptions options, WebSocketOptions ws) throws IOException {
+    private static final SecureRandom RANDOM = new SecureRandom();
+
+    /**
+     * A listener on {@code host:port/path}; the path is {@code /} when there is none.
+     *
+     * @param secure over TLS, with the context of the options: {@code wss://}
+     */
+    static Listener listen(String hostPortPath, boolean secure, TransportOptions options, WebSocketOptions ws)
+            throws IOException {
+        if (secure && options.tls() == null) {
+            throw new IOException("a wss listener requires an SSLContext with a server certificate (TransportOptions.withTls)");
+        }
         final int slash = hostPortPath.indexOf('/');
         final String hostPort = slash < 0 ? hostPortPath : hostPortPath.substring(0, slash);
         final String path = slash < 0 ? "/" : hostPortPath.substring(slash);
@@ -92,20 +107,25 @@ final class Ws {
             server.close();
             throw e;
         }
-        return new Tcp.SocketListener(server, "ws") {
+        return new Tcp.SocketListener(server, secure ? "wss" : "ws") {
             @Override
-            void accepted(Socket socket, Acceptor acceptor) {
-                // The request of a client is read on a thread of its own: one
-                // that takes its time must not hold up the next.
-                Threads.daemon("vrpc-ws-upgrade " + socket.getRemoteSocketAddress(), () -> {
+            void accepted(Socket plain, Acceptor acceptor) {
+                // The request of a client is read on a thread of its own, and
+                // its TLS handshake made there: one that takes its time must
+                // not hold up the next.
+                Threads.daemon("vrpc-ws-upgrade " + plain.getRemoteSocketAddress(), () -> {
                     MsgConn conn = null;
                     try {
-                        conn = upgrade(socket, path, options, ws);
+                        Tcp.tune(plain, options);
+                        final long timeout = ws.handshakeTimeoutMillis();
+                        final long deadline = timeout > 0 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout) : 0;
+                        final Socket socket = secure ? Tls.server(plain, options, timeout) : plain;
+                        conn = upgrade(plain, socket, path, deadline, options, ws);
                     } catch (IOException | RuntimeException e) {
                         // dropped below
                     }
                     if (conn == null) {
-                        closeQuietly(socket);
+                        closeQuietly(plain);
                     } else {
                         acceptor.onConnection(conn);
                     }
@@ -133,18 +153,16 @@ final class Ws {
      * Reads the request of a client and answers it. Gives the connection, or
      * null when the request was refused, which the client has been told.
      */
-    private static MsgConn upgrade(Socket socket, String path, TransportOptions options, WebSocketOptions ws)
-            throws IOException {
-        Tcp.tune(socket, options);
-        final long timeout = ws.handshakeTimeoutMillis();
-        final long deadline = timeout > 0 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout) : 0;
-        socket.setSoTimeout(timeout > 0 ? (int) Math.min(timeout, Integer.MAX_VALUE) : 0);
+    private static MsgConn upgrade(Socket plain, Socket socket, String path, long deadline, TransportOptions options,
+            WebSocketOptions ws) throws IOException {
+        plain.setSoTimeout(left(deadline));
         final InputStream in = new BufferedInputStream(socket.getInputStream(), 64 * 1024);
         final OutputStream out = socket.getOutputStream();
 
         final Map<String, String> headers = new HashMap<String, String>();
-        final String[] line = readHead(in, deadline, headers);
-        if (line == null) {
+        final String first = readHead(in, deadline, headers);
+        final String[] line = first == null ? new String[0] : first.split(" ");
+        if (line.length != 3 || !line[2].startsWith("HTTP/1.")) {
             refuse(out, "400 Bad Request", null);
             return null;
         }
@@ -200,8 +218,109 @@ final class Ws {
         answer.append("\r\n");
         out.write(answer.toString().getBytes(StandardCharsets.ISO_8859_1));
         out.flush();
-        socket.setSoTimeout(0);
-        return new WsConn(socket, in, out, codec, options, ws);
+        plain.setSoTimeout(0);
+        return new WsConn(plain, socket, in, out, codec, false, options, ws);
+    }
+
+    /** What is left of a time, as the timeout of a socket: 0 for no limit, and never less than a millisecond. */
+    private static int left(long deadlineNanos) throws IOException {
+        if (deadlineNanos == 0) {
+            return 0;
+        }
+        final long millis = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime());
+        if (millis <= 0) {
+            throw new SocketTimeoutException("the websocket handshake took too long");
+        }
+        return (int) Math.min(millis, Integer.MAX_VALUE);
+    }
+
+    // --- the side that dials -------------------------------------------------------
+
+    /**
+     * A dialer to {@code host:port/path}. The port is that of HTTP when the
+     * address has none, 80 or 443, and the path {@code /}.
+     *
+     * @param secure over TLS: {@code wss://}
+     */
+    static Dialer dialer(String hostPortPath, boolean secure, TransportOptions options, WebSocketOptions ws) {
+        final int slash = hostPortPath.indexOf('/');
+        final String authority = slash < 0 ? hostPortPath : hostPortPath.substring(0, slash);
+        final String path = slash < 0 ? "/" : hostPortPath.substring(slash);
+        // An IPv6 address has colons of its own, and its port comes behind the bracket.
+        final boolean hasPort = authority.lastIndexOf(':') > authority.lastIndexOf(']');
+        final String hostPort = hasPort ? authority : authority + ":" + (secure ? 443 : 80);
+        // The first of the codecs is the one a client speaks: MessagePack unless it was given another.
+        final WireCodec codec = ws.codecs().isEmpty() ? WireCodec.MSGPACK : ws.codecs().get(0);
+        return new Dialer() {
+            @Override
+            public MsgConn dial(long timeoutMillis) throws IOException {
+                final long deadline = timeoutMillis > 0 ? System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis) : 0;
+                final Socket plain = Tcp.connect(hostPort, options, timeoutMillis);
+                try {
+                    final Socket socket = secure ? Tls.client(plain, Tls.hostOf(hostPort), options, left(deadline)) : plain;
+                    return ask(plain, socket, authority, path, codec, deadline, options, ws);
+                } catch (IOException | RuntimeException e) {
+                    closeQuietly(plain);
+                    throw e;
+                }
+            }
+
+            @Override
+            public String toString() {
+                return (secure ? "wss://" : "ws://") + hostPortPath;
+            }
+        };
+    }
+
+    /**
+     * Asks a server to upgrade the connection, and reads its answer. The
+     * codec is offered as a subprotocol, and the server has to take it: one
+     * that names none, or another, speaks something this side does not, and
+     * the two must not exchange frames in a codec they did not agree on. As
+     * the Go client.
+     */
+    private static MsgConn ask(Socket plain, Socket socket, String authority, String path, WireCodec codec, long deadline,
+            TransportOptions options, WebSocketOptions ws) throws IOException {
+        plain.setSoTimeout(left(deadline));
+        final InputStream in = new BufferedInputStream(socket.getInputStream(), 64 * 1024);
+        final OutputStream out = socket.getOutputStream();
+        final byte[] nonce = new byte[16];
+        RANDOM.nextBytes(nonce);
+        final String key = Base64.getEncoder().encodeToString(nonce);
+        out.write(("GET " + path + " HTTP/1.1\r\n"
+                + "Host: " + authority + "\r\n"
+                + "Upgrade: websocket\r\n"
+                + "Connection: Upgrade\r\n"
+                + "Sec-WebSocket-Key: " + key + "\r\n"
+                + "Sec-WebSocket-Version: 13\r\n"
+                + "Sec-WebSocket-Protocol: " + codec.subprotocol() + "\r\n"
+                + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
+        out.flush();
+
+        final Map<String, String> headers = new HashMap<String, String>();
+        final String first = readHead(in, deadline, headers);
+        if (first == null || !first.startsWith("HTTP/1.")) {
+            throw new IOException("websocket dial: what answered is not an HTTP server");
+        }
+        final String[] line = first.split(" ", 3);
+        if (line.length < 2 || !line[1].equals("101")) {
+            throw new IOException("websocket dial: the server did not upgrade the connection: " + first.substring(first.indexOf(' ') + 1));
+        }
+        if (!hasToken(headers.get("upgrade"), "websocket") || !hasToken(headers.get("connection"), "upgrade")
+                || !accept(key).equals(trimmed(headers.get("sec-websocket-accept")))) {
+            throw new IOException("websocket dial: what answered is not a WebSocket server");
+        }
+        if (!trimmed(headers.get("sec-websocket-extensions")).isEmpty()) {
+            throw new IOException("websocket dial: the server takes an extension that was not asked for: "
+                    + headers.get("sec-websocket-extensions"));
+        }
+        final String agreed = trimmed(headers.get("sec-websocket-protocol"));
+        if (!agreed.equalsIgnoreCase(codec.subprotocol())) {
+            throw new IOException("server did not negotiate wire codec \"" + codec.subprotocol() + "\" (got subprotocol \""
+                    + agreed + "\"); it predates the codec negotiation or does not enable this codec");
+        }
+        plain.setSoTimeout(0);
+        return new WsConn(plain, socket, in, out, codec, true, options, ws);
     }
 
     private static void refuse(OutputStream out, String status, String headers) throws IOException {
@@ -215,14 +334,14 @@ final class Ws {
      *
      * @param headers takes the headers, by their names in lower case; one
      *                that comes twice has its values joined with a comma
-     * @return the method and what is asked for, or null when what came is not a request
+     * @return its first line, or null when what came is not the head of a request or of an answer
      */
-    private static String[] readHead(InputStream in, long deadlineNanos, Map<String, String> headers) throws IOException {
+    private static String readHead(InputStream in, long deadlineNanos, Map<String, String> headers) throws IOException {
         final ByteArrayOutputStream head = new ByteArrayOutputStream(512);
         int ends = 0; // how many of the four bytes that end a head have come
         while (ends < 4) {
             if (deadlineNanos != 0 && System.nanoTime() > deadlineNanos) {
-                throw new SocketTimeoutException("the request took too long");
+                throw new SocketTimeoutException("the websocket handshake took too long");
             }
             final int b = in.read();
             if (b < 0) {
@@ -239,8 +358,7 @@ final class Ws {
             }
         }
         final String[] lines = new String(head.toByteArray(), StandardCharsets.ISO_8859_1).split("\r\n");
-        final String[] first = lines.length == 0 ? new String[0] : lines[0].split(" ");
-        if (first.length != 3 || !first[2].startsWith("HTTP/1.")) {
+        if (lines.length == 0 || lines[0].isEmpty()) {
             return null;
         }
         for (int i = 1; i < lines.length; i++) {
@@ -253,7 +371,7 @@ final class Ws {
             final String before = headers.get(name);
             headers.put(name, before == null ? value : before + ", " + value);
         }
-        return first;
+        return lines[0];
     }
 
     private static String trimmed(String value) {
@@ -346,38 +464,56 @@ final class Ws {
 
     // --- frames --------------------------------------------------------------------
 
-    /** A frame as a server sends it: whole, and without a mask. */
-    private static byte[] frame(int opcode, byte[] payload) {
-        final byte[] out = new byte[headLength(payload.length) + payload.length];
-        final int at = putHead(out, 0, opcode, payload.length);
-        System.arraycopy(payload, 0, out, at, payload.length);
+    /**
+     * A whole frame. A client masks what it sends, with a mask of its own
+     * for each frame, and a server does not: as RFC 6455 has it.
+     */
+    private static byte[] frame(int opcode, byte[] payload, boolean masked) {
+        final byte[] out = new byte[headLength(payload.length, masked) + payload.length];
+        putFrame(out, 0, opcode, payload, masked);
         return out;
     }
 
-    private static int headLength(int payload) {
-        return payload < 126 ? 2 : payload <= 0xffff ? 4 : 10;
+    private static int headLength(int payload, boolean masked) {
+        return (payload < 126 ? 2 : payload <= 0xffff ? 4 : 10) + (masked ? 4 : 0);
     }
 
-    private static int putHead(byte[] out, int at, int opcode, int payload) {
+    /** Writes a frame into an array, and gives where the next one begins. */
+    private static int putFrame(byte[] out, int at, int opcode, byte[] payload, boolean masked) {
+        final int length = payload.length;
+        final int maskBit = masked ? 0x80 : 0;
         out[at++] = (byte) (0x80 | opcode);
-        if (payload < 126) {
-            out[at++] = (byte) payload;
-        } else if (payload <= 0xffff) {
-            out[at++] = 126;
-            out[at++] = (byte) (payload >>> 8);
-            out[at++] = (byte) payload;
+        if (length < 126) {
+            out[at++] = (byte) (maskBit | length);
+        } else if (length <= 0xffff) {
+            out[at++] = (byte) (maskBit | 126);
+            out[at++] = (byte) (length >>> 8);
+            out[at++] = (byte) length;
         } else {
-            out[at++] = 127;
+            out[at++] = (byte) (maskBit | 127);
             out[at++] = 0;
             out[at++] = 0;
             out[at++] = 0;
             out[at++] = 0;
-            out[at++] = (byte) (payload >>> 24);
-            out[at++] = (byte) (payload >>> 16);
-            out[at++] = (byte) (payload >>> 8);
-            out[at++] = (byte) payload;
+            out[at++] = (byte) (length >>> 24);
+            out[at++] = (byte) (length >>> 16);
+            out[at++] = (byte) (length >>> 8);
+            out[at++] = (byte) length;
         }
-        return at;
+        if (!masked) {
+            System.arraycopy(payload, 0, out, at, length);
+            return at + length;
+        }
+        // The mask is not to be guessed by whoever wrote the payload: RFC 6455, 5.3.
+        final int mask = RANDOM.nextInt();
+        out[at++] = (byte) (mask >>> 24);
+        out[at++] = (byte) (mask >>> 16);
+        out[at++] = (byte) (mask >>> 8);
+        out[at++] = (byte) mask;
+        for (int i = 0; i < length; i++) {
+            out[at + i] = (byte) (payload[i] ^ (mask >>> (24 - 8 * (i & 3))));
+        }
+        return at + length;
     }
 
     /** The payload of a close frame: why, as its number. */
@@ -398,10 +534,14 @@ final class Ws {
 
     /** One connection: a socket that carries WebSocket frames, read by a thread of its own. */
     private static final class WsConn implements MsgConn {
+        /** The socket of the connection, and the one its streams are of: the same, or a TLS socket over it. */
+        private final Socket plain;
         private final Socket socket;
         private final InputStream in;
         private final OutputStream out;
         private final WireCodec codec;
+        /** The side that dialed: it masks what it sends, and takes nothing that is masked. */
+        private final boolean client;
         private final String remoteAddress;
         private final int maxFrameSize;
         private final long writeTimeoutMillis;
@@ -415,13 +555,15 @@ final class Ws {
         /** A ping was sent and nothing has come since. Only the thread that reads touches it. */
         private boolean pinged;
 
-        WsConn(Socket socket, InputStream in, OutputStream out, WireCodec codec, TransportOptions options,
-                WebSocketOptions ws) {
+        WsConn(Socket plain, Socket socket, InputStream in, OutputStream out, WireCodec codec, boolean client,
+                TransportOptions options, WebSocketOptions ws) {
+            this.plain = plain;
             this.socket = socket;
             this.in = in;
             this.out = out;
             this.codec = codec;
-            this.remoteAddress = String.valueOf(socket.getRemoteSocketAddress());
+            this.client = client;
+            this.remoteAddress = String.valueOf(plain.getRemoteSocketAddress());
             this.maxFrameSize = options.maxFrameSize();
             this.writeTimeoutMillis = options.writeTimeoutMillis();
             this.pingIntervalMillis = (int) Math.max(0, Math.min(ws.pingIntervalMillis(), Integer.MAX_VALUE));
@@ -441,7 +583,7 @@ final class Ws {
             Throwable cause = null;
             try {
                 // A read that waits this long finds the connection silent, and asks the peer whether it is there.
-                socket.setSoTimeout(pingIntervalMillis);
+                plain.setSoTimeout(pingIntervalMillis);
                 byte[] message = null; // the frames so far of a message that comes in several
                 int kind = 0;
                 for (;;) {
@@ -458,8 +600,10 @@ final class Ws {
                     if ((b0 & 0x70) != 0) {
                         throw new Violation(PROTOCOL_ERROR, "a frame with the bits of an extension, and none was agreed on");
                     }
-                    if ((b1 & 0x80) == 0) {
-                        throw new Violation(PROTOCOL_ERROR, "a frame of a client without a mask");
+                    final boolean masked = (b1 & 0x80) != 0;
+                    if (masked == client) {
+                        throw new Violation(PROTOCOL_ERROR,
+                                client ? "a frame of a server with a mask" : "a frame of a client without a mask");
                     }
                     long length = b1 & 0x7f;
                     if (length == 126) {
@@ -470,8 +614,10 @@ final class Ws {
                             throw new Violation(PROTOCOL_ERROR, "a frame of a length that is not one");
                         }
                     }
-                    final byte[] mask = new byte[4];
-                    readFully(mask, 4);
+                    final byte[] mask = masked ? new byte[4] : null;
+                    if (masked) {
+                        readFully(mask, 4);
+                    }
                     pinged = false;
 
                     if (opcode >= CLOSE) {
@@ -618,8 +764,10 @@ final class Ws {
                 }
                 have += got;
             }
-            for (int i = 0; i < length; i++) {
-                buf[i] ^= mask[i & 3];
+            if (mask != null) {
+                for (int i = 0; i < length; i++) {
+                    buf[i] ^= mask[i & 3];
+                }
             }
             return buf;
         }
@@ -657,7 +805,7 @@ final class Ws {
             try {
                 for (int i = 0; i < payloads.length; i++) {
                     payloads[i] = codec.encode(batch.get(i));
-                    total += headLength(payloads[i].length) + payloads[i].length;
+                    total += headLength(payloads[i].length, client) + payloads[i].length;
                 }
             } catch (ValueException e) {
                 throw new IOException(codec.name() + " encode, " + e.getMessage(), e);
@@ -668,9 +816,7 @@ final class Ws {
             final byte[] frames = new byte[(int) total];
             int at = 0;
             for (byte[] payload : payloads) {
-                at = putHead(frames, at, opcode, payload.length);
-                System.arraycopy(payload, 0, frames, at, payload.length);
-                at += payload.length;
+                at = putFrame(frames, at, opcode, payload, client);
             }
             writeLock.lock();
             try {
@@ -687,7 +833,7 @@ final class Ws {
         private void control(int opcode, byte[] payload) throws IOException {
             writeLock.lock();
             try {
-                send(frame(opcode, payload));
+                send(frame(opcode, payload, client));
             } finally {
                 writeLock.unlock();
             }
@@ -716,6 +862,11 @@ final class Ws {
             return remoteAddress;
         }
 
+        @Override
+        public SSLSession tlsSession() {
+            return socket instanceof SSLSocket ? ((SSLSocket) socket).getSession() : null;
+        }
+
         // --- the end ---
 
         /**
@@ -736,9 +887,12 @@ final class Ws {
                 final ScheduledFuture<?> guard =
                         Threads.TIMER.schedule(this::closeSocket, CLOSE_WAIT_MILLIS, TimeUnit.MILLISECONDS);
                 try {
-                    out.write(frame(CLOSE, status(NORMAL)));
+                    out.write(frame(CLOSE, status(NORMAL), client));
                     out.flush();
-                    socket.shutdownOutput();
+                    if (socket == plain) {
+                        // Over TLS the goodbye of TLS would have to come first, and not every platform can say it.
+                        plain.shutdownOutput();
+                    }
                     said = true;
                 } catch (IOException e) {
                     // closed below
@@ -755,7 +909,11 @@ final class Ws {
 
         private void closeSocket() {
             if (socketClosed.compareAndSet(false, true)) {
-                closeQuietly(socket);
+                // The socket under a TLS one first: closing that never waits for a writer that is held up.
+                closeQuietly(plain);
+                if (socket != plain) {
+                    closeQuietly(socket);
+                }
             }
         }
 

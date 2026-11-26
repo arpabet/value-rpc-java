@@ -5,7 +5,7 @@
 
 // Command client is the Go implementation as a client, for the tests of what
 // the Java one serves: it connects to the address it is given, over QUIC, over
-// TCP or over WebSocket, runs the scenarios it is given, and says how each
+// TCP, over TLS or over WebSocket, runs the scenarios it is given, and says how each
 // went,
 //
 //	OK calls
@@ -48,6 +48,7 @@ import (
 func main() {
 	addr := flag.String("quic", "", "the address of the QUIC server, host:port")
 	tcpAddr := flag.String("tcp", "", "the address of a TCP server, host:port, in place of a QUIC one")
+	tlsAddr := flag.String("tls", "", "the address of a TLS server, host:port, in place of a QUIC one; with -ca, and -cert and -key")
 	wsURL := flag.String("ws", "", "the URL of a WebSocket server, ws://host:port/path, in place of a QUIC one")
 	codec := flag.String("codec", "msgpack", "the codec of a WebSocket connection: msgpack or json")
 	credential := flag.String("credential", "", "what the handshake carries for the authenticator of the server")
@@ -57,8 +58,8 @@ func main() {
 	timeout := flag.Int64("timeout", 10000, "the timeout of a call, in milliseconds")
 	connectTimeout := flag.Int64("connect-timeout", 10000, "the timeout of connecting, in milliseconds")
 	flag.Parse()
-	if (*addr == "" || *caFile == "") && *tcpAddr == "" && *wsURL == "" {
-		fmt.Fprintln(os.Stderr, "usage: client (-quic host:port -ca ca.pem [-cert c.pem -key k.pem] | -tcp host:port | -ws url [-codec json]) scenario...")
+	if ((*addr == "" && *tlsAddr == "") || *caFile == "") && *tcpAddr == "" && *wsURL == "" {
+		fmt.Fprintln(os.Stderr, "usage: client ((-quic | -tls) host:port -ca ca.pem [-cert c.pem -key k.pem] | -tcp host:port | -ws url [-codec json]) scenario...")
 		os.Exit(2)
 	}
 
@@ -97,7 +98,11 @@ func main() {
 			}
 			config.Certificates = []tls.Certificate{cert}
 		}
-		cli = valuequic.NewClient(*addr, config)
+		if *tlsAddr != "" {
+			cli = valueclient.NewTLSClient(*tlsAddr, config, metadata)
+		} else {
+			cli = valuequic.NewClient(*addr, config)
+		}
 	}
 	if *credential != "" {
 		cli.SetCredential(value.Utf8(*credential))
@@ -147,6 +152,8 @@ func main() {
 			err = cancelCall(cli)
 		case "resume":
 			err = resume(cli)
+		case "reverse":
+			err = reverse(cli)
 		default:
 			err = fmt.Errorf("unknown scenario")
 		}
@@ -567,4 +574,78 @@ func resume(cli valueclient.Client) error {
 		}
 	}
 	return fmt.Errorf("the client did not come back: %w", err)
+}
+
+// reverse has the server ask this client back, by each pattern. The client
+// serves what the conformance servers ask for (notify, tail, ingest), and
+// calls the functions of theirs that ask (reverse.call, reverse.pull,
+// reverse.push).
+func reverse(cli valueclient.Client) error {
+	ingested := make(chan value.Value, 16)
+	if err := cli.AddFunction("notify", valuerpc.Any, valuerpc.Any, func(ctx context.Context, args value.Value) (value.Value, error) {
+		return value.Utf8("client-saw:" + args.(value.List).GetAt(0).String()), nil
+	}); err != nil {
+		return err
+	}
+	if err := cli.AddOutgoingStream("tail", valuerpc.Any, func(ctx context.Context, args value.Value) (<-chan value.Value, error) {
+		n := args.(value.List).GetAt(0).(value.Number).Long()
+		out := make(chan value.Value)
+		go func() {
+			defer close(out)
+			for i := int64(0); i < n; i++ {
+				select {
+				case out <- value.Utf8(fmt.Sprintf("t%d", i)):
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		return out, nil
+	}); err != nil {
+		return err
+	}
+	if err := cli.AddIncomingStream("ingest", valuerpc.Any, func(ctx context.Context, args value.Value, in <-chan value.Value) error {
+		go func() {
+			for v := range in {
+				ingested <- v
+			}
+		}()
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	res, err := cli.CallFunction(bg, "reverse.call", value.Tuple(value.Utf8("ping")))
+	if err != nil || res.String() != "client-saw:ping" {
+		return fmt.Errorf("reverse.call = %v, %v", res, err)
+	}
+	// More than a window of credit, so that the client waits for the server to take what it sends.
+	res, err = cli.CallFunction(bg, "reverse.pull", value.Tuple(value.Long(6000)))
+	if err != nil {
+		return fmt.Errorf("reverse.pull: %w", err)
+	}
+	pulled, ok := res.(value.List)
+	if !ok || pulled.Len() != 6000 || pulled.GetAt(0).String() != "t0" || pulled.GetAt(5999).String() != "t5999" {
+		return fmt.Errorf("reverse.pull gave %d values", pulled.Len())
+	}
+	res, err = cli.CallFunction(bg, "reverse.push", value.Tuple(value.Utf8("go")))
+	if err != nil || res.String() != "pushed" {
+		return fmt.Errorf("reverse.push = %v, %v", res, err)
+	}
+	for i := int64(1); i <= 3; i++ {
+		select {
+		case v := <-ingested:
+			if got := v.(value.Number).Long(); got != i*100 {
+				return fmt.Errorf("ingest took %d, want %d", got, i*100)
+			}
+		case <-time.After(10 * time.Second):
+			return fmt.Errorf("ingest took %d of 3 values", i-1)
+		}
+	}
+	// A function the client does not serve: the server is told so, and tells who asked.
+	_, err = cli.CallFunction(bg, "reverse.pull.missing", nil)
+	if valuerpc.CodeOf(err) != valuerpc.CodeNotFound {
+		return fmt.Errorf("a function that is not there = %v", err)
+	}
+	return nil
 }

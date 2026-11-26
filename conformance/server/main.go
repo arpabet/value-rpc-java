@@ -14,6 +14,7 @@
 //	LISTENING tcp 127.0.0.1:53124
 //	LISTENING tls 127.0.0.1:53129
 //	LISTENING ws 127.0.0.1:53125/rpc
+//	LISTENING wss 127.0.0.1:53130/rpc
 //	LISTENING quic 127.0.0.1:53126
 //	LISTENING quic-small 127.0.0.1:53127
 //	LISTENING quic-mtls 127.0.0.1:53128
@@ -42,6 +43,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -78,6 +80,22 @@ func main() {
 	if err != nil {
 		fail("bind tls", err)
 	}
+	// WebSocket over TLS: the handler of a WebSocket server, on an HTTPS server
+	// of this program's own, as the Go implementation has it for wss://.
+	wss, wssHandler, err := valueserver.NewWebSocketHandler(logger)
+	if err != nil {
+		fail("wss handler", err)
+	}
+	wssListener, err := tls.Listen("tcp", env("VRPC_WSS_ADDR", "127.0.0.1:0"),
+		&tls.Config{Certificates: []tls.Certificate{pki.server}})
+	if err != nil {
+		fail("bind wss", err)
+	}
+	wssMux := http.NewServeMux()
+	wssMux.Handle("/rpc", wssHandler)
+	go func() {
+		_ = (&http.Server{Handler: wssMux}).Serve(wssListener)
+	}()
 	quicAddr := env("VRPC_QUIC_ADDR", "127.0.0.1:0")
 	quic, err := valuequic.NewServer(quicAddr, &tls.Config{Certificates: []tls.Certificate{pki.server}}, logger)
 	if err != nil {
@@ -101,7 +119,7 @@ func main() {
 	}
 
 	state := &shared{}
-	servers := []valueserver.Server{tcp, tlsSrv, ws, quic, quicSmall, quicMTLS}
+	servers := []valueserver.Server{tcp, tlsSrv, ws, wss, quic, quicSmall, quicMTLS}
 	for _, srv := range servers {
 		register(srv, state)
 		go func(srv valueserver.Server) {
@@ -114,6 +132,7 @@ func main() {
 	fmt.Printf("LISTENING tcp %s\n", tcp.Addr().String())
 	fmt.Printf("LISTENING tls %s\n", tlsSrv.Addr().String())
 	fmt.Printf("LISTENING ws %s/rpc\n", ws.Addr().String())
+	fmt.Printf("LISTENING wss %s/rpc\n", wssListener.Addr().String())
 	fmt.Printf("LISTENING quic %s\n", quic.Addr().String())
 	fmt.Printf("LISTENING quic-small %s\n", quicSmall.Addr().String())
 	fmt.Printf("LISTENING quic-mtls %s\n", quicMTLS.Addr().String())
@@ -128,6 +147,7 @@ func main() {
 	for _, srv := range servers {
 		srv.Close()
 	}
+	wssListener.Close()
 }
 
 // pki is a certificate authority made for one run, and what it signed: a

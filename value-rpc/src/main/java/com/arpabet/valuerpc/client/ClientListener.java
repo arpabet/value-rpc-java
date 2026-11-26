@@ -31,4 +31,13 @@ public interface ClientListener {
     /** The peer sent a message that is not one, or that answers nothing. It was dropped. */
     default void onProtocolError(MapValue message, String problem) {
     }
+
+    /**
+     * A handler of this client failed with something that is not an answer
+     * while it served the server: the server was told {@code INTERNAL}.
+     *
+     * @param what the handler, as its caller is told: {@code function notify}
+     */
+    default void onHandlerFailure(String what, Throwable error) {
+    }
 }

@@ -641,12 +641,12 @@ class WebSocketListenerTest {
         } finally {
             root.close();
         }
-        // A client of this library does not dial WebSocket yet, and says so when it is asked to.
+        // Over TLS a listener needs a certificate to show, and says so when it has none.
         try {
-            Transports.dialer("ws://127.0.0.1:1/rpc", TransportOptions.DEFAULT).dial(1000);
-            throw new AssertionError("there is no WebSocket dialer yet");
+            Transports.listener("wss://127.0.0.1:0/rpc", TransportOptions.DEFAULT).close();
+            throw new AssertionError("a listener over TLS without a certificate");
         } catch (IOException expected) {
-            assertTrue(expected.getMessage().contains("not dialed yet"), expected.getMessage());
+            assertTrue(expected.getMessage().contains("requires an SSLContext"), expected.getMessage());
         }
     }
 }

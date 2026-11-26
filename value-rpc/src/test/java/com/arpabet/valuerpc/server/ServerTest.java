@@ -71,7 +71,7 @@ class ServerTest {
 
     private static void overEachTransport(Consumer<VrpcServer.Builder> setup, Scenario scenario) throws Exception {
         for (Wire wire : Wire.all()) {
-            final VrpcServer.Builder builder = VrpcServer.builder().address(wire.listen());
+            final VrpcServer.Builder builder = VrpcServer.builder().address(wire.listen()).transportOptions(wire.options());
             setup.accept(builder);
             try (ConformanceServer server = ConformanceServer.start(builder, new ConformanceServer.Shared())) {
                 scenario.run(server, wire);
@@ -768,7 +768,7 @@ class ServerTest {
     @Test
     void whatAClientAsksBehindItsHandshakeIsServedInItsOrder() throws Exception {
         for (Wire wire : Wire.all()) {
-            final VrpcServer server = VrpcServer.builder().address(wire.listen())
+            final VrpcServer server = VrpcServer.builder().address(wire.listen()).transportOptions(wire.options())
                     .authenticator((conn, credential) -> {
                         Thread.sleep(200); // an authenticator that asks someone
                         return "slowly";
@@ -993,7 +993,7 @@ class ServerTest {
             for (long flush : new long[] {10_000, 0}) {
                 final AtomicInteger returned = new AtomicInteger();
                 final VrpcServer server = VrpcServer.builder()
-                        .listen(new SlowListener(Transports.listener(wire.listen(), TransportOptions.DEFAULT), flush > 0 ? 200 : 2000))
+                        .listen(new SlowListener(Transports.listener(wire.listen(), wire.options()), flush > 0 ? 200 : 2000))
                         .closeFlushMillis(flush)
                         .metrics(new Metrics() {
                             @Override

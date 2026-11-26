@@ -18,9 +18,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <pre>
  *   host:port, tcp://host:port     TCP
- *   ws://host:port/path            WebSocket, to listen on: what a browser connects to
+ *   tls://host:port                TLS: the same frames over a TLS socket
+ *   ws://host:port/path            WebSocket: what a browser connects to
+ *   wss://host:port/path           WebSocket over TLS
  *   mem://name                     inside this process
  * </pre>
+ *
+ * TLS is set up with {@link TransportOptions#withTls}; a listener needs it,
+ * and a dialer without it trusts the public authorities. A WebSocket dialer
+ * leaves the port out for that of HTTP, 80 or 443.
  *
  * and a transport of one's own is a {@link Dialer} or a {@link Listener}, for
  * which {@link #dialer(StreamSource, TransportOptions)} and
@@ -53,8 +59,12 @@ public final class Transports {
                 return new Tcp.TcpDialer(a[1], options);
             case "mem":
                 return Mem.dialer(a[1]);
+            case "tls":
+                return Tls.dialer(a[1], options);
             case "ws":
-                return failing("ws:// is listened on and not dialed yet: a client of this library reaches a server over tcp://");
+                return Ws.dialer(a[1], false, options, WebSocketOptions.DEFAULT);
+            case "wss":
+                return Ws.dialer(a[1], true, options, WebSocketOptions.DEFAULT);
             case "quic":
                 return failing("quic:// is provided by the separate module com.arpabet:value-rpc-quic (QuicTransport.dialer)");
             default:
@@ -72,8 +82,12 @@ public final class Transports {
                 return Tcp.listen(a[1], options);
             case "mem":
                 return Mem.listen(a[1]);
+            case "tls":
+                return Tls.listen(a[1], options);
             case "ws":
-                return Ws.listen(a[1], options, WebSocketOptions.DEFAULT);
+                return Ws.listen(a[1], false, options, WebSocketOptions.DEFAULT);
+            case "wss":
+                return Ws.listen(a[1], true, options, WebSocketOptions.DEFAULT);
             case "quic":
                 throw new IOException(
                         "quic:// is provided by the separate module com.arpabet:value-rpc-quic (QuicTransport.listener)");
@@ -88,11 +102,33 @@ public final class Transports {
      * another ping.
      *
      * @param address {@code host:port/path}, with or without {@code ws://}
-     *                before it; the path is {@code /} when it has none
+     *                before it, or with {@code wss://} for one over TLS; the
+     *                path is {@code /} when it has none
      */
     public static Listener webSocketListener(String address, TransportOptions options, WebSocketOptions webSocket)
             throws IOException {
-        return Ws.listen(address.startsWith("ws://") ? address.substring(5) : address, options, webSocket);
+        final boolean secure = address.startsWith("wss://");
+        return Ws.listen(withoutScheme(address), secure, options, webSocket);
+    }
+
+    /**
+     * A WebSocket dialer that is set up otherwise than by default: one that
+     * speaks JSON, which is the first of the codecs of the options, or one
+     * with another ping.
+     *
+     * @param address {@code host:port/path}, with or without {@code ws://}
+     *                before it, or with {@code wss://} for one over TLS; the
+     *                port is that of HTTP when it has none, 80 or 443, and
+     *                the path {@code /}
+     */
+    public static Dialer webSocketDialer(String address, TransportOptions options, WebSocketOptions webSocket) {
+        final boolean secure = address.startsWith("wss://");
+        return Ws.dialer(withoutScheme(address), secure, options, webSocket);
+    }
+
+    private static String withoutScheme(String address) {
+        final int at = address.indexOf("://");
+        return at < 0 ? address : address.substring(at + 3);
     }
 
     private static Dialer failing(String why) {

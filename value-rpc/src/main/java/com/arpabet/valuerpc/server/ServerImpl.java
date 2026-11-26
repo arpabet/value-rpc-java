@@ -11,20 +11,19 @@ import com.arpabet.value.StringValue;
 import com.arpabet.value.Value;
 import com.arpabet.valuerpc.ChatHandler;
 import com.arpabet.valuerpc.Code;
-import com.arpabet.valuerpc.CreditGate;
 import com.arpabet.valuerpc.Dialect;
 import com.arpabet.valuerpc.Frames;
+import com.arpabet.valuerpc.HandlerRegistry;
 import com.arpabet.valuerpc.HashChain;
 import com.arpabet.valuerpc.IncomingStreamHandler;
+import com.arpabet.valuerpc.Initiator;
 import com.arpabet.valuerpc.MessageType;
 import com.arpabet.valuerpc.Metrics;
 import com.arpabet.valuerpc.OutgoingStreamHandler;
-import com.arpabet.valuerpc.RequestContext;
-import com.arpabet.valuerpc.StreamBuffer;
+import com.arpabet.valuerpc.Peer;
+import com.arpabet.valuerpc.Responder;
 import com.arpabet.valuerpc.TypeDef;
 import com.arpabet.valuerpc.UnaryHandler;
-import com.arpabet.valuerpc.ValueSink;
-import com.arpabet.valuerpc.ValueStream;
 import com.arpabet.valuerpc.VrpcException;
 import com.arpabet.valuerpc.transport.Listener;
 import com.arpabet.valuerpc.transport.MsgConn;
@@ -43,7 +42,6 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
@@ -53,13 +51,17 @@ import java.util.concurrent.locks.ReentrantLock;
  * The server. A connection has a thread of the transport that reads it and
  * hands each message to {@link Connection#dispatch}, which never waits, and a
  * thread of the server that writes what is queued for it, several messages
- * at once when several wait. A request is a number and a handler on a thread
- * of its own; a message that carries the number is handed to it.
+ * at once when several wait. What a client asks is with the
+ * {@link Responder} of the connection it came on: a request is a number and
+ * a handler on a thread of its own, and a message that carries the number is
+ * handed to it.
  *
  * <p>A client is a session, known by the id its handshake carries, and a
  * session has one connection at a time. The requests of a client belong to
  * the connection they came on: when it is lost, or the client comes back on
- * another, they are cancelled, since the client has given them up too.
+ * another, they are cancelled, since the client has given them up too. What
+ * the server asks of a client is with the {@link Initiator} of its session,
+ * and fails when the connection it went out on is gone.
  */
 final class ServerImpl implements VrpcServer {
 
@@ -72,23 +74,31 @@ final class ServerImpl implements VrpcServer {
     /** How many messages a client may send behind its handshake before the handshake is answered. */
     private static final int MAX_EARLY = 64;
 
+    /** How long a client has to take a stream the server opens on it, unless the one who opens it says: as in the Go server. */
+    private static final long REVERSE_ESTABLISH_MILLIS = 10_000;
+
+    /** What a connection is closed with when its client came back on another, and what the server had asked on it is told. */
+    private static final String REPLACED = "connection replaced by reconnect";
+    private static final String REPLACED_REVERSE = "connection replaced by reconnect; reverse request cannot complete";
+
     private final Listener listener;
     private final Dialect dialect;
     private final ConnectAuthorizer authorizer;
     private final Authenticator authenticator;
     private final long maxConnections;
-    private final long maxRequests;
-    private final long maxStreams;
     private final int sendQueue;
-    private final int streamWindow;
     private final long handshakeTimeoutMillis;
     private final long sessionRetentionMillis;
     private final long closeFlushMillis;
     private final Metrics metrics;
     private final ServerListener events;
 
-    /** What is served, by name. */
-    private final ConcurrentHashMap<String, Registered> functions = new ConcurrentHashMap<String, Registered>();
+    /** What is served, by name. A name is registered once: as in the Go server. */
+    private final HandlerRegistry registry = new HandlerRegistry(false);
+    /** How what a client asks is served, on whichever connection it comes. */
+    private final Responder.Setup serving;
+    /** How a client is asked. */
+    private final Initiator.Setup asking;
     /** The clients, by the id of their handshake. */
     private final ConcurrentHashMap<Long, Session> sessions = new ConcurrentHashMap<Long, Session>();
     /** Every connection that is not gone, let in or not. */
@@ -111,10 +121,7 @@ final class ServerImpl implements VrpcServer {
         this.authorizer = b.authorizer;
         this.authenticator = b.authenticator;
         this.maxConnections = b.maxConnections;
-        this.maxRequests = b.maxConcurrentRequests;
-        this.maxStreams = b.maxConcurrentStreams;
         this.sendQueue = b.sendQueue;
-        this.streamWindow = b.streamWindow;
         this.handshakeTimeoutMillis = b.handshakeTimeoutMillis;
         this.sessionRetentionMillis = b.sessionRetentionMillis;
         this.closeFlushMillis = b.closeFlushMillis;
@@ -129,6 +136,12 @@ final class ServerImpl implements VrpcServer {
             this.ownExecutor = Executors.newCachedThreadPool(r -> daemon("vrpc-server-worker", r));
             this.executor = ownExecutor;
         }
+        this.serving = new Responder.Setup(true, dialect, registry, metrics, timer, executor, b.maxConcurrentRequests,
+                b.maxConcurrentStreams, b.streamWindow, taken);
+        // A server names no time of its own for what it asks: a call is
+        // bounded by its caller, a stream by the time a client has to take it.
+        this.asking = new Initiator.Setup(false, dialect, metrics, timer, b.streamWindow, null, null,
+                REVERSE_ESTABLISH_MILLIS);
     }
 
     private static Thread daemon(String name, Runnable task) {
@@ -149,87 +162,24 @@ final class ServerImpl implements VrpcServer {
 
     // --- what it serves ------------------------------------------------------------
 
-    /** What a name serves: one pattern, with what its arguments and its result must be. */
-    private static final class Registered {
-        final MessageType kind;
-        final TypeDef args;
-        final TypeDef result;
-        final UnaryHandler unary;
-        final OutgoingStreamHandler outgoing;
-        final IncomingStreamHandler incoming;
-        final ChatHandler chat;
-
-        Registered(MessageType kind, TypeDef args, TypeDef result, UnaryHandler unary, OutgoingStreamHandler outgoing,
-                IncomingStreamHandler incoming, ChatHandler chat) {
-            this.kind = kind;
-            this.args = args == null ? TypeDef.ANY : args;
-            this.result = result == null ? TypeDef.ANY : result;
-            this.unary = unary;
-            this.outgoing = outgoing;
-            this.incoming = incoming;
-            this.chat = chat;
-        }
-    }
-
-    private void register(String name, Object handler, Registered fn) {
-        if (name == null || name.isEmpty()) {
-            throw new IllegalArgumentException("what is served needs a name");
-        }
-        if (handler == null) {
-            throw new IllegalArgumentException("no handler for " + name);
-        }
-        // A server refuses a name twice, where a client replaces: as in the Go implementation.
-        if (functions.putIfAbsent(name, fn) != null) {
-            throw new IllegalStateException("function already exists: " + name);
-        }
-    }
-
     @Override
     public void addFunction(String name, TypeDef args, TypeDef result, UnaryHandler handler) {
-        register(name, handler, new Registered(MessageType.FUNCTION_REQUEST, args, result, handler, null, null, null));
+        registry.addFunction(name, args, result, handler);
     }
 
     @Override
     public void addOutgoingStream(String name, TypeDef args, OutgoingStreamHandler handler) {
-        register(name, handler, new Registered(MessageType.GET_STREAM_REQUEST, args, TypeDef.VOID, null, handler, null, null));
+        registry.addOutgoingStream(name, args, handler);
     }
 
     @Override
     public void addIncomingStream(String name, TypeDef args, IncomingStreamHandler handler) {
-        register(name, handler, new Registered(MessageType.PUT_STREAM_REQUEST, args, TypeDef.VOID, null, null, handler, null));
+        registry.addIncomingStream(name, args, handler);
     }
 
     @Override
     public void addChat(String name, TypeDef args, ChatHandler handler) {
-        register(name, handler, new Registered(MessageType.CHAT_REQUEST, args, TypeDef.VOID, null, null, null, handler));
-    }
-
-    /** The number the Go implementation prints for a pattern, in the answer to a request of the wrong one. */
-    private static int pattern(MessageType kind) {
-        switch (kind) {
-            case FUNCTION_REQUEST:
-                return 0;
-            case GET_STREAM_REQUEST:
-                return 1;
-            case PUT_STREAM_REQUEST:
-                return 2;
-            default:
-                return 3;
-        }
-    }
-
-    /** What a handler is called in the answer to its caller: {@code function greet}. */
-    private static String where(MessageType kind, String name) {
-        switch (kind) {
-            case FUNCTION_REQUEST:
-                return "function " + name;
-            case GET_STREAM_REQUEST:
-                return "out stream " + name;
-            case PUT_STREAM_REQUEST:
-                return "in stream " + name;
-            default:
-                return "chat " + name;
-        }
+        registry.addChat(name, args, handler);
     }
 
     // --- running -------------------------------------------------------------------
@@ -319,9 +269,11 @@ final class ServerImpl implements VrpcServer {
      * A client, across its connections: who it is, the last link of its hash
      * chain that was accepted, and the connection it is on now.
      */
-    private final class Session {
+    private final class Session implements Initiator.Host {
         final long clientId;
         final String principal;
+        /** What the server asks of this client: the peer a handler is given, across the connections of the client. */
+        final Initiator peer = new Initiator(asking, this);
         /** The last link accepted: the next one shown must hash forward to it. */
         private String token;
         private Connection connection;
@@ -366,9 +318,48 @@ final class ServerImpl implements VrpcServer {
             }
             if (old != null && old != next) {
                 // What was asked on it cannot be answered there any more, and the client has given it up.
-                old.close("connection replaced by reconnect");
+                old.close(REPLACED);
             }
             return true;
+        }
+
+        /** The connection to ask the client on. */
+        @Override
+        public Initiator.Link connected() {
+            final Connection c;
+            final boolean dropped;
+            synchronized (this) {
+                c = connection;
+                dropped = reaped;
+            }
+            if (closed) {
+                throw new VrpcException(Code.UNAVAILABLE, "server closed");
+            }
+            if (dropped || c == null || !c.isOpen()) {
+                throw new VrpcException(Code.UNAVAILABLE, dropped ? "client closed" : "client is not connected");
+            }
+            return c;
+        }
+
+        @Override
+        public VrpcException closed() {
+            if (closed) {
+                return new VrpcException(Code.UNAVAILABLE, "server closed");
+            }
+            final boolean dropped;
+            synchronized (this) {
+                dropped = reaped;
+            }
+            return dropped ? new VrpcException(Code.UNAVAILABLE, "client closed") : null;
+        }
+
+        @Override
+        public void protocolError(MapValue message, String problem) {
+            final Connection c;
+            synchronized (this) {
+                c = connection;
+            }
+            events.onProtocolError(c == null ? "" : c.remote, message, problem);
         }
 
         /**
@@ -400,14 +391,18 @@ final class ServerImpl implements VrpcServer {
                 reaped = true;
             }
             sessions.remove(clientId, this);
+            peer.failAll(new VrpcException(Code.UNAVAILABLE, "client closed"));
         }
 
-        synchronized void end() {
-            reaped = true;
-            if (reap != null) {
-                reap.cancel(false);
-                reap = null;
+        void end() {
+            synchronized (this) {
+                reaped = true;
+                if (reap != null) {
+                    reap.cancel(false);
+                    reap = null;
+                }
             }
+            peer.failAll(new VrpcException(Code.UNAVAILABLE, "server closed"));
         }
     }
 
@@ -440,14 +435,11 @@ final class ServerImpl implements VrpcServer {
 
     // --- connections ---------------------------------------------------------------
 
-    private final class Connection implements MsgConn.Receiver {
+    private final class Connection implements MsgConn.Receiver, Initiator.Link, Responder.Link, Responder.Events {
         final MsgConn conn;
         final String remote;
-        /** The requests that are not over, by their id. */
-        final ConcurrentHashMap<Long, Serving> requests = new ConcurrentHashMap<Long, Serving>();
-        /** The handlers that run and have not taken their stream yet: what the limit of requests counts. */
-        final AtomicLong inFlight = new AtomicLong();
-        final AtomicLong liveStreams = new AtomicLong();
+        /** What the client asks on this connection. */
+        final Responder responder = new Responder(serving, this, this);
 
         private final Object shaking = new Object();
         /** Under {@code shaking}. */
@@ -476,6 +468,41 @@ final class ServerImpl implements VrpcServer {
         Connection(MsgConn conn) {
             this.conn = conn;
             this.remote = conn.remoteAddress();
+        }
+
+        // --- what the two halves of the engine ask of a connection ---
+
+        /** Whether the server can ask on it: its client is let in, and it is not gone. */
+        @Override
+        public boolean isOpen() {
+            return outbox != null && !over.get();
+        }
+
+        @Override
+        public String remoteAddress() {
+            return remote;
+        }
+
+        @Override
+        public String principal() {
+            final Session s = session;
+            return s == null ? "" : s.principal;
+        }
+
+        @Override
+        public Peer peer() {
+            final Session s = session;
+            return s == null ? null : s.peer;
+        }
+
+        @Override
+        public void protocolError(MapValue message, String problem) {
+            events.onProtocolError(remote, message, problem);
+        }
+
+        @Override
+        public void handlerFailure(String where, Throwable error) {
+            events.onHandlerFailure(where, error);
         }
 
         /** Begins to read, once the authorizer has let the connection in. */
@@ -581,12 +608,17 @@ final class ServerImpl implements VrpcServer {
                 return;
             }
             session = s;
-            outbox = new ArrayBlockingQueue<MapValue>(sendQueue);
+            // The answer to the handshake is queued before the queue is there
+            // for anyone else: nothing the server asks of this client goes
+            // out before it. The server has no token to give: the client owns
+            // the chain.
+            final ArrayBlockingQueue<MapValue> box = new ArrayBlockingQueue<MapValue>(sendQueue);
+            box.add(dialect.handshakeResponse(null));
+            queued.incrementAndGet();
+            outbox = box;
             final Thread w = daemon("vrpc-send " + remote, this::sendLoop);
             sender = w;
             w.start();
-            // The server has no token to give: the client owns the chain.
-            send(dialect.handshakeResponse(null));
             synchronized (shaking) {
                 if (stage == SHAKING) {
                     stage = OPEN;
@@ -678,54 +710,34 @@ final class ServerImpl implements VrpcServer {
             }
             final long id = idValue.longValue();
             final MessageType type = MessageType.of(typeNumber.longValue());
-            final Serving serving = requests.get(id);
-            if (serving != null) {
-                serving.onMessage(type, message);
+            if (id > 0) {
+                // What the client asks, and what it sends for a request of its own.
+                responder.onMessage(type, idValue, message);
+                return;
+            }
+            if (id < 0 && (type == null || !type.opensRequest())) {
+                // About a request this server opened on the client.
+                final Session s = session;
+                if (s != null) {
+                    s.peer.onMessage(type, id, message);
+                }
                 return;
             }
             if (type == MessageType.CANCEL_REQUEST || type == MessageType.FUNCTION_RESPONSE
                     || type == MessageType.ERROR_RESPONSE) {
-                // For a request that is over: a cancel that crossed its answer, an answer nobody waits for.
+                // With the id of the handshake: nothing waits for it.
                 return;
             }
-            if (id <= 0) {
-                // 0 is the handshake, and the negative ones are the server's to give.
-                trySend(dialect.error(idValue, Code.INVALID_ARGUMENT, "client-initiated request id must be positive"));
-                events.onProtocolError(remote, message, "client request id must be positive");
-                return;
-            }
-            if (type == null) {
-                events.onProtocolError(remote, message, "unknown message type");
-                return;
-            }
-            if (!type.opensRequest()) {
-                // A value or a credit of a stream that is over: on its way when the stream ended.
-                return;
-            }
-            // A handler slot is taken, or the request refused: it is never
-            // queued, and the connection is read on either way.
-            if (inFlight.incrementAndGet() > maxRequests && maxRequests > 0) {
-                inFlight.decrementAndGet();
-                trySend(dialect.error(idValue, Code.RESOURCE_EXHAUSTED,
-                        "server busy: too many concurrent requests (max " + maxRequests + ")"));
-                return;
-            }
-            taken.incrementAndGet();
-            final Serving s = new Serving(this, idValue, type, message);
-            // Known before its handler runs, so that a cancel always finds it.
-            requests.put(id, s);
-            if (over.get()) {
-                s.lost(why);
-            }
-            if (!run(s::serve)) {
-                s.refuse(Code.UNAVAILABLE, closed ? "server closed" : "server busy: no thread for the request");
-            }
+            // A request of a client has a positive id: 0 is the handshake, and the negative ones are the server's to give.
+            trySend(dialect.error(idValue, Code.INVALID_ARGUMENT, "client-initiated request id must be positive"));
+            events.onProtocolError(remote, message, "client request id must be positive");
         }
 
         // --- writing ---
 
         /** Queues a message, waiting while the queue is full. False when the connection is gone. */
-        boolean send(MapValue message) {
+        @Override
+        public boolean send(MapValue message) {
             final ArrayBlockingQueue<MapValue> box = outbox;
             if (box == null) {
                 return false;
@@ -744,7 +756,8 @@ final class ServerImpl implements VrpcServer {
         }
 
         /** Queues a message if there is room at once: for the thread that reads, which must not wait. */
-        boolean trySend(MapValue message) {
+        @Override
+        public boolean trySend(MapValue message) {
             final ArrayBlockingQueue<MapValue> box = outbox;
             if (box != null && !over.get() && box.offer(message)) {
                 queued.incrementAndGet();
@@ -841,11 +854,11 @@ final class ServerImpl implements VrpcServer {
             connections.remove(this);
             live.decrementAndGet();
             // Nobody waits for its requests any more: their handlers are told, and the streams end.
-            for (Serving s : requests.values()) {
-                s.lost(why);
-            }
+            responder.lost(why);
             final Session s = session;
             if (s != null) {
+                // What the server asked on it cannot be answered any more either.
+                s.peer.failOn(this, REPLACED.equals(why) ? REPLACED_REVERSE : null);
                 s.gone(this);
             }
             flushLock.lock();
@@ -858,688 +871,5 @@ final class ServerImpl implements VrpcServer {
                 events.onDisconnected(s.clientId, remote, cause);
             }
         }
-    }
-
-    // --- requests ------------------------------------------------------------------
-
-    /**
-     * A request that is not over, and what its handler is told about it. It
-     * is made on the thread that reads, when the request arrives, and served
-     * on a thread of the handlers.
-     *
-     * <p>A request is over for the peer when it is retired: taken out of the
-     * requests of its connection, by whoever ends it, once. A call is retired
-     * when its handler has returned. A stream is retired the moment it ends,
-     * by either side or with the connection; its handler may still be on its
-     * way out then, and learns of the end from its stream.
-     */
-    private final class Serving implements RequestContext {
-        final Connection c;
-        final NumberValue idValue;
-        final long id;
-        final MessageType kind;
-        final MapValue request;
-        final String name;
-        final String where;
-        final long startNanos = System.nanoTime();
-
-        /** What the peer sends; null when it sends nothing. */
-        final StreamBuffer in;
-        /** The credit to send with; null when this side sends nothing. */
-        final CreditGate out;
-
-        private final AtomicBoolean retired = new AtomicBoolean();
-        /** The slot of a handler, held until the call is over or the stream is taken. */
-        private final AtomicBoolean slot = new AtomicBoolean(true);
-        /** Counted among the open streams of the connection. Under the monitor. */
-        private boolean counted;
-
-        private volatile Map<String, String> metadata;
-        /** When the time the caller allowed is up, in nanoseconds of the clock; 0 for none. */
-        private volatile long deadlineNanos;
-        private volatile ScheduledFuture<?> deadline;
-
-        private volatile boolean cancelled;
-        /** Nobody is to be answered: the peer gave the request up, or is gone. */
-        private volatile boolean quiet;
-        private volatile boolean deadlinePassed;
-        /** Why a stream is gone, for a handler that asks its stream. */
-        private volatile VrpcException error;
-        /** What runs when the request is cancelled. Under the monitor. */
-        private ArrayList<Runnable> callbacks;
-        /** The thread of the handler, while it runs: the one to interrupt. Under the monitor. */
-        private Thread thread;
-
-        /** Guards the step that tells the peer the stream is taken, so that nothing of the stream leaves before it. */
-        private final Object taking = new Object();
-        private boolean established;
-        private volatile boolean outEnded;
-        /** Values taken since credit was last granted. Only the thread that reads the stream touches it. */
-        private long takenSinceGrant;
-
-        Serving(Connection c, NumberValue idValue, MessageType kind, MapValue request) {
-            this.c = c;
-            this.idValue = idValue;
-            this.id = idValue.longValue();
-            this.kind = kind;
-            this.request = request;
-            final String n = dialect.functionName(request);
-            this.name = n == null ? "" : n;
-            this.where = ServerImpl.where(kind, name);
-            this.in = kind == MessageType.PUT_STREAM_REQUEST || kind == MessageType.CHAT_REQUEST
-                    ? new StreamBuffer(streamWindow, this::taken1) : null;
-            this.out = kind == MessageType.GET_STREAM_REQUEST || kind == MessageType.CHAT_REQUEST
-                    ? new CreditGate() : null;
-            metrics.requestBegin(name);
-        }
-
-        // --- what a handler is told ---
-
-        @Override
-        public long requestId() {
-            return id;
-        }
-
-        @Override
-        public String method() {
-            return name;
-        }
-
-        @Override
-        public Map<String, String> metadata() {
-            Map<String, String> md = metadata;
-            if (md == null) {
-                md = dialect.metadata(request);
-                metadata = md;
-            }
-            return md;
-        }
-
-        @Override
-        public String principal() {
-            final Session s = c.session;
-            return s == null ? "" : s.principal;
-        }
-
-        @Override
-        public String remoteAddress() {
-            return c.remote;
-        }
-
-        @Override
-        public long remainingMillis() {
-            final long at = deadlineNanos;
-            if (at == 0) {
-                return -1;
-            }
-            return Math.max(0, TimeUnit.NANOSECONDS.toMillis(at - System.nanoTime()));
-        }
-
-        @Override
-        public boolean isCancelled() {
-            return cancelled;
-        }
-
-        @Override
-        public void onCancel(Runnable callback) {
-            if (callback == null) {
-                return;
-            }
-            synchronized (this) {
-                if (!cancelled) {
-                    if (callbacks == null) {
-                        callbacks = new ArrayList<Runnable>(2);
-                    }
-                    callbacks.add(callback);
-                    return;
-                }
-            }
-            run(callback);
-        }
-
-        // --- how it ends ---
-
-        private void releaseSlot() {
-            if (slot.compareAndSet(true, false)) {
-                c.inFlight.decrementAndGet();
-            }
-        }
-
-        /**
-         * Takes the request out of the ones that are not over. Whoever takes
-         * it out is the one to say how it ended: every way a request can end
-         * comes here, and only the first gets true.
-         */
-        private boolean retire(Code code) {
-            return retire(code, null);
-        }
-
-        /**
-         * Retires the request and leaves with it why it is gone, in one step
-         * for whoever looks at it under its monitor: a handler that finds its
-         * stream over can then say why, also when the one that ended it has
-         * not yet come to let go of what waits on the stream.
-         */
-        private boolean retire(Code code, VrpcException reason) {
-            final boolean wasCounted;
-            synchronized (this) {
-                if (!retired.compareAndSet(false, true)) {
-                    return false;
-                }
-                error = reason;
-                wasCounted = counted;
-                counted = false;
-            }
-            c.requests.remove(id, this);
-            releaseSlot();
-            if (wasCounted) {
-                c.liveStreams.decrementAndGet();
-            }
-            final ScheduledFuture<?> t = deadline;
-            if (t != null) {
-                t.cancel(false);
-            }
-            metrics.requestEnd(name, code, System.nanoTime() - startNanos);
-            return true;
-        }
-
-        /**
-         * Nobody waits for the request any more. The handler is told: by the
-         * flag, by what it asked to have run, and by an interrupt, which
-         * wakes one that waits.
-         *
-         * @param silently nobody is there to be answered either
-         */
-        private void cancel(boolean silently, boolean byDeadline) {
-            final ArrayList<Runnable> run;
-            synchronized (this) {
-                if (silently) {
-                    quiet = true;
-                }
-                if (cancelled) {
-                    return;
-                }
-                deadlinePassed = byDeadline;
-                cancelled = true;
-                if (thread != null) {
-                    thread.interrupt();
-                }
-                run = callbacks;
-                callbacks = null;
-            }
-            if (run != null) {
-                for (Runnable r : run) {
-                    ServerImpl.this.run(r);
-                }
-            }
-        }
-
-        /** Lets go of whoever waits on the stream: they ask why, and are told. */
-        private void drop() {
-            if (in != null) {
-                in.stop();
-            }
-            if (out != null) {
-                out.close();
-            }
-        }
-
-        /** The connection is gone, or the server closes. */
-        void lost(String reason) {
-            final boolean stream = kind != MessageType.FUNCTION_REQUEST
-                    && retire(Code.UNAVAILABLE, new VrpcException(Code.UNAVAILABLE, reason));
-            // In this order: a handler that is woken, by the interrupt or by
-            // its stream, finds its request cancelled and can ask why.
-            cancel(true, false);
-            if (stream) {
-                drop();
-            }
-        }
-
-        /** Refused before it ran, on the thread that reads: the answer is sent if there is room for it at once. */
-        void refuse(Code code, String text) {
-            if (retire(code)) {
-                c.trySend(dialect.error(idValue, code, text));
-            }
-        }
-
-        private void fail(Code code, String text) {
-            if (retire(code)) {
-                c.send(dialect.error(idValue, code, text));
-            }
-        }
-
-        /** A message of the client for this request. On the thread that reads the connection: it must not wait. */
-        void onMessage(MessageType type, MapValue message) {
-            if (type == null) {
-                events.onProtocolError(c.remote, message, "unknown message type");
-                return;
-            }
-            switch (type) {
-                case CANCEL_REQUEST:
-                    if (kind == MessageType.FUNCTION_REQUEST) {
-                        // The handler is told, and the call is over when it has returned: it is not answered.
-                        cancel(true, false);
-                    } else if (retire(Code.CANCELED,
-                            new VrpcException(Code.CANCELED, "request " + id + " canceled by peer"))) {
-                        cancel(true, false);
-                        drop();
-                    }
-                    break;
-                case STREAM_VALUE: {
-                    if (in == null) {
-                        events.onProtocolError(c.remote, message, "a value for a request that takes none");
-                        break;
-                    }
-                    final Value v = dialect.streamValueOf(message);
-                    if (v == null) {
-                        break;
-                    }
-                    if (in.offer(v)) {
-                        metrics.streamValue(name);
-                    } else if (in.overflowed()) {
-                        // The client sent more than it had credit for: the
-                        // stream is cut short, and both sides are told.
-                        final VrpcException truncated = new VrpcException(Code.RESOURCE_EXHAUSTED,
-                                "inbound stream " + id + " truncated: client exceeded flow-control credit");
-                        if (!retire(Code.RESOURCE_EXHAUSTED, truncated)) {
-                            break;
-                        }
-                        c.trySend(dialect.error(idValue, Code.RESOURCE_EXHAUSTED, truncated.detail()));
-                        cancel(true, false);
-                        drop();
-                    }
-                    break;
-                }
-                case STREAM_END: {
-                    if (in == null) {
-                        events.onProtocolError(c.remote, message, "an end for a request that takes no values");
-                        break;
-                    }
-                    // An end may carry a last value.
-                    final Value last = dialect.streamValueOf(message);
-                    if (last != null && in.offer(last)) {
-                        metrics.streamValue(name);
-                    }
-                    in.end();
-                    if (kind == MessageType.PUT_STREAM_REQUEST) {
-                        // The stream is over for the client. The handler
-                        // takes what has arrived at its own pace, and is not
-                        // disturbed.
-                        retire(Code.OK);
-                    }
-                    // A chat goes on: the client ending what it sends ends nothing else.
-                    break;
-                }
-                case STREAM_CREDIT: {
-                    final NumberValue credit = dialect.credit(message);
-                    if (out != null && credit != null) {
-                        out.grant(credit.longValue());
-                    }
-                    break;
-                }
-                default:
-                    events.onProtocolError(c.remote, message, "unknown message type");
-            }
-        }
-
-        // --- serving ---
-
-        /** Serves the request, on a thread of the handlers, to the end of its handler. */
-        void serve() {
-            synchronized (this) {
-                if (cancelled) {
-                    // Given up before it began.
-                    retire(Code.CANCELED);
-                    return;
-                }
-                thread = Thread.currentThread();
-            }
-            try {
-                admitted();
-            } catch (RuntimeException | Error e) {
-                left();
-                retire(Code.INTERNAL);
-                drop();
-                events.onHandlerFailure(where, e);
-            }
-        }
-
-        /** The handler has returned: nothing interrupts this thread on its behalf from here on. */
-        private void left() {
-            synchronized (this) {
-                thread = null;
-            }
-            Thread.interrupted();
-        }
-
-        /**
-         * Checks the request against what is registered, in the order of the
-         * Go server, and runs its handler.
-         */
-        private void admitted() {
-            if (dialect.functionName(request) == null) {
-                left();
-                fail(Code.INVALID_ARGUMENT, "function name field not found");
-                return;
-            }
-            final Registered fn = functions.get(name);
-            if (fn == null) {
-                left();
-                fail(Code.NOT_FOUND, "function not found " + name);
-                return;
-            }
-            final Value args = dialect.arguments(request);
-            if (!fn.args.verify(args)) {
-                left();
-                fail(Code.INVALID_ARGUMENT, "function '" + name + "' invalid args");
-                return;
-            }
-            if (fn.kind != kind) {
-                left();
-                fail(Code.INVALID_ARGUMENT, "function wrong type " + name + ", expected " + pattern(fn.kind)
-                        + ", actual " + pattern(kind));
-                return;
-            }
-            if (kind == MessageType.FUNCTION_REQUEST) {
-                call(fn, args);
-            } else {
-                stream(fn, args);
-            }
-        }
-
-        private void call(Registered fn, Value args) {
-            // The time the caller allows is the deadline of the handler: of a call only.
-            final long sla = dialect.slaMillis(request);
-            if (sla > 0) {
-                deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(sla);
-                try {
-                    deadline = timer.schedule(() -> cancel(false, true), sla, TimeUnit.MILLISECONDS);
-                } catch (RejectedExecutionException e) {
-                    // the server is closing, which cancels the call itself
-                }
-            }
-            Value result = null;
-            Throwable thrown = null;
-            try {
-                result = fn.unary.handle(this, args);
-            } catch (Throwable t) {
-                thrown = t;
-            }
-            left();
-            final MapValue answer;
-            final Code code;
-            if (thrown != null) {
-                answer = failure(thrown);
-                code = Code.of(dialect.errorOf(answer).codeNumber());
-            } else if (!fn.result.verify(result)) {
-                answer = dialect.error(idValue, Code.INTERNAL, "function '" + name + "' invalid results");
-                code = Code.INTERNAL;
-            } else {
-                answer = dialect.functionResult(idValue, result);
-                code = Code.OK;
-            }
-            if (retire(code) && !quiet) {
-                c.send(answer);
-            }
-        }
-
-        private void stream(Registered fn, Value args) {
-            // A stream counts among the open ones from here to its end.
-            final boolean room;
-            synchronized (this) {
-                if (retired.get()) {
-                    room = true; // over already: it is not counted, and what follows finds it so
-                } else if (c.liveStreams.incrementAndGet() > maxStreams && maxStreams > 0) {
-                    c.liveStreams.decrementAndGet();
-                    room = false;
-                } else {
-                    counted = true;
-                    room = true;
-                }
-            }
-            if (!room) {
-                left();
-                fail(Code.RESOURCE_EXHAUSTED, "server busy: too many concurrent streams (max " + maxStreams + ")");
-                return;
-            }
-            if (in != null && !retired.get()) {
-                // The client may send this many values. The credit comes before the stream is said to be taken.
-                c.send(dialect.streamCredit(idValue, streamWindow));
-            }
-            Throwable thrown = null;
-            try {
-                switch (kind) {
-                    case GET_STREAM_REQUEST:
-                        fn.outgoing.handle(this, args, outgoing);
-                        break;
-                    case PUT_STREAM_REQUEST:
-                        fn.incoming.handle(this, args, incoming);
-                        break;
-                    default:
-                        fn.chat.handle(this, args, incoming, outgoing);
-                }
-            } catch (Throwable t) {
-                thrown = t;
-            }
-            left();
-            if (thrown != null) {
-                // Before the stream was taken this is what the client gets in
-                // place of it; after, it ends the stream.
-                final MapValue answer = failure(thrown);
-                if (retire(Code.of(dialect.errorOf(answer).codeNumber()))) {
-                    if (!quiet) {
-                        c.send(answer);
-                    }
-                    drop();
-                }
-                return;
-            }
-            ready();
-            if (kind == MessageType.PUT_STREAM_REQUEST) {
-                // The handler is done. What the client has not sent yet is not wanted, and it is told to stop.
-                giveUp(Code.OK);
-            } else {
-                endOut();
-            }
-        }
-
-        /**
-         * The answer to a handler that threw. One that was interrupted
-         * because its request was cancelled says so as the Go server does,
-         * whose handler returns the error of its context.
-         */
-        private MapValue failure(Throwable thrown) {
-            int number = VrpcException.handlerCodeNumber(thrown);
-            String detail = VrpcException.handlerDetail(thrown);
-            final VrpcException coded = VrpcException.in(thrown);
-            final boolean chosen = coded != null && coded.codeNumber() != Code.UNKNOWN.number();
-            if (!chosen && number == Code.CANCELED.number() && cancelled) {
-                if (deadlinePassed) {
-                    number = Code.DEADLINE_EXCEEDED.number();
-                    detail = "context deadline exceeded";
-                } else {
-                    detail = "context canceled";
-                }
-            }
-            if (number == Code.INTERNAL.number() && !chosen) {
-                events.onHandlerFailure(where, thrown);
-            }
-            return dialect.error(idValue, number, where + ": " + detail);
-        }
-
-        // --- streams ---
-
-        /**
-         * Tells the client that the stream is taken, once: when the handler
-         * first reads or sends, or when it returns. Until then a handler that
-         * throws refuses the stream. From here on the stream no longer holds
-         * the slot of a handler.
-         */
-        private void ready() {
-            synchronized (taking) {
-                if (established) {
-                    return;
-                }
-                established = true;
-                releaseSlot();
-                if (!retired.get()) {
-                    c.send(dialect.streamReady(idValue));
-                }
-            }
-        }
-
-        /** Why this stream takes no more: what ended it, or else that it is over. */
-        private VrpcException gone() {
-            final VrpcException e;
-            synchronized (this) {
-                e = error;
-            }
-            return e != null ? e : new VrpcException(Code.CANCELED, "stream " + id + " is closed");
-        }
-
-        /** The handler took a value: the client may send another, told in batches of half the window. */
-        private void taken1() {
-            takenSinceGrant++;
-            if (takenSinceGrant >= Math.max(1, streamWindow / 2)) {
-                final long n = takenSinceGrant;
-                takenSinceGrant = 0;
-                if (!retired.get()) {
-                    c.send(dialect.streamCredit(idValue, n));
-                }
-            }
-        }
-
-        /**
-         * What a handler that was interrupted while it waited on its stream
-         * is told: why the stream is gone, when it is, since that is why it
-         * was interrupted. Any other interrupt is the handler's own.
-         */
-        private InterruptedException woken(InterruptedException e) {
-            final VrpcException why;
-            synchronized (this) {
-                why = error;
-            }
-            if (why == null) {
-                return e;
-            }
-            Thread.currentThread().interrupt();
-            throw why;
-        }
-
-        private Value takeValue(long nanos) throws InterruptedException, TimeoutException {
-            ready();
-            final Value v;
-            try {
-                v = in.take(nanos);
-            } catch (InterruptedException e) {
-                throw woken(e);
-            }
-            if (v == null) {
-                final VrpcException e = error;
-                if (e != null) {
-                    throw e;
-                }
-            }
-            return v;
-        }
-
-        private void sendValue(Value value) throws InterruptedException {
-            if (value == null || value.isNull()) {
-                throw new IllegalArgumentException("a stream does not carry null");
-            }
-            ready();
-            if (outEnded || retired.get()) {
-                throw gone();
-            }
-            // Wait for the client to have room: only this thread waits.
-            final boolean room;
-            try {
-                room = out.acquire();
-            } catch (InterruptedException e) {
-                throw woken(e);
-            }
-            if (!room) {
-                throw gone();
-            }
-            if (retired.get()) {
-                throw gone();
-            }
-            if (!c.send(dialect.streamValue(idValue, value))) {
-                throw gone();
-            }
-            metrics.streamValue(name);
-        }
-
-        /** This side has no more to send, which ends the stream, of either kind. */
-        private void endOut() {
-            synchronized (taking) {
-                if (outEnded) {
-                    return;
-                }
-                outEnded = true;
-            }
-            ready();
-            if (retire(Code.OK)) {
-                c.send(dialect.streamEnd(idValue, null));
-                drop();
-            }
-        }
-
-        /** The handler gives the stream up before its end, which the client is told. */
-        private void giveUp(Code code) {
-            if (retire(code)) {
-                c.send(dialect.cancelRequest(idValue));
-                drop();
-            }
-        }
-
-        final ValueStream incoming = new ValueStream() {
-            @Override
-            public Value take() throws InterruptedException {
-                try {
-                    return takeValue(0);
-                } catch (TimeoutException e) {
-                    throw new AssertionError(e);
-                }
-            }
-
-            @Override
-            public Value take(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException {
-                return takeValue(Math.max(1, unit.toNanos(timeout)));
-            }
-
-            @Override
-            public long requestId() {
-                return id;
-            }
-
-            @Override
-            public void close() {
-                giveUp(Code.CANCELED);
-            }
-        };
-
-        final ValueSink outgoing = new ValueSink() {
-            @Override
-            public void send(Value value) throws InterruptedException {
-                sendValue(value);
-            }
-
-            @Override
-            public long requestId() {
-                return id;
-            }
-
-            @Override
-            public void close() {
-                endOut();
-            }
-
-            @Override
-            public void cancel() {
-                giveUp(Code.CANCELED);
-            }
-        };
     }
 }

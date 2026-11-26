@@ -5,10 +5,12 @@
 
 package com.arpabet.valuerpc.server;
 
+import com.arpabet.valuerpc.Pki;
 import com.arpabet.valuerpc.WireCodec;
 import com.arpabet.valuerpc.transport.Dialer;
 import com.arpabet.valuerpc.transport.TransportOptions;
 import com.arpabet.valuerpc.transport.Transports;
+import com.arpabet.valuerpc.transport.WebSocketOptions;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -26,6 +28,11 @@ abstract class Wire {
 
     /** An address for a server to listen on, another each time. */
     abstract String listen();
+
+    /** What a server on this transport is set up with: its certificate, over TLS. */
+    TransportOptions options() {
+        return TransportOptions.DEFAULT;
+    }
 
     /** A dialer to a server, by the address the server says it listens on. */
     abstract Dialer dialer(String serverAddress);
@@ -78,13 +85,77 @@ abstract class Wire {
 
     static final Wire WS_JSON = webSocket(WireCodec.JSON);
 
-    /** Every transport a server of the core listens on, and WebSocket in each of its codecs. */
+    /** WebSocket with a codec, reached by the WebSocket client of this library. */
+    private static Wire ownWebSocket(WireCodec codec) {
+        return new Wire("ws " + codec.name() + ", own client") {
+            @Override
+            String listen() {
+                return "ws://127.0.0.1:0/rpc";
+            }
+
+            @Override
+            Dialer dialer(String serverAddress) {
+                return Transports.webSocketDialer("ws://" + serverAddress, TransportOptions.DEFAULT,
+                        WebSocketOptions.DEFAULT.withCodecs(codec));
+            }
+        };
+    }
+
+    static final Wire WS_OWN_MSGPACK = ownWebSocket(WireCodec.MSGPACK);
+
+    static final Wire WS_OWN_JSON = ownWebSocket(WireCodec.JSON);
+
+    /** The frames of TCP over TLS, the server known by its certificate. */
+    static final Wire TLS = new Wire("tls") {
+        @Override
+        String listen() {
+            return "tls://127.0.0.1:0";
+        }
+
+        @Override
+        TransportOptions options() {
+            return TransportOptions.DEFAULT.withTls(Pki.get().server());
+        }
+
+        @Override
+        Dialer dialer(String serverAddress) {
+            return Transports.dialer("tls://" + serverAddress, TransportOptions.DEFAULT.withTls(Pki.get().client()));
+        }
+    };
+
+    /** WebSocket over TLS, reached by the WebSocket client of this library. */
+    static final Wire WSS = new Wire("wss") {
+        @Override
+        String listen() {
+            return "wss://127.0.0.1:0/rpc";
+        }
+
+        @Override
+        TransportOptions options() {
+            return TransportOptions.DEFAULT.withTls(Pki.get().server());
+        }
+
+        @Override
+        Dialer dialer(String serverAddress) {
+            return Transports.dialer("wss://" + serverAddress, TransportOptions.DEFAULT.withTls(Pki.get().client()));
+        }
+    };
+
+    /**
+     * Every transport a server of the core listens on: in memory, TCP, TLS,
+     * and WebSocket in each of its codecs, reached by the WebSocket client
+     * of the JDK and by the one of this library, also over TLS.
+     */
     static List<Wire> all() {
         final List<Wire> all = new ArrayList<Wire>();
         all.add(MEM);
         all.add(TCP);
         all.add(WS_MSGPACK);
         all.add(WS_JSON);
+        all.add(WS_OWN_MSGPACK);
+        all.add(WS_OWN_JSON);
+        all.add(TLS);
+        all.add(WSS);
         return all;
     }
 }
